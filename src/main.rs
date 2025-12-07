@@ -1,3 +1,4 @@
+use chrono::{Datelike, Days, Local, Months, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -18,14 +19,19 @@ struct App {
     cursor_x: usize,
     cursor_y: usize,
     // tasks_visible: bool,
+    current_date: NaiveDate, // The date being displayed
+    today: NaiveDate,        // Today's date for comparison
     exit: bool,
 }
 
 impl App {
     fn new() -> App {
+        let today = Local::now().date_naive();
         App {
             cursor_x: 0,
             cursor_y: 1,
+            current_date: today,
+            today: today,
             // tasks_visible: false,
             exit: false,
         }
@@ -37,6 +43,14 @@ impl App {
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    pub fn title(&self) -> String {
+        self.today.format("%D %B %Y").to_string()
+    }
+
+    fn first_day_of_month(&self) -> NaiveDate {
+        NaiveDate::from_ymd_opt(self.current_date.year(), self.current_date.month(), 1).unwrap()
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -77,6 +91,7 @@ impl App {
                 self.cursor_y += 1;
             }
         }
+        self.today = self.today.checked_add_days(Days::new(1)).unwrap();
     }
 
     fn move_left(&mut self) {
@@ -88,6 +103,7 @@ impl App {
                 self.cursor_y -= 1;
             }
         }
+        self.today = self.today.checked_sub_days(Days::new(1)).unwrap();
     }
 
     fn move_up(&mut self) {
@@ -96,6 +112,7 @@ impl App {
         } else {
             self.cursor_y = 4;
         }
+        self.today = self.today.checked_sub_days(Days::new(7)).unwrap();
     }
 
     fn move_down(&mut self) {
@@ -104,6 +121,7 @@ impl App {
         } else {
             self.cursor_y = 0;
         }
+        self.today = self.today.checked_add_days(Days::new(7)).unwrap();
     }
 }
 
@@ -126,7 +144,7 @@ impl Widget for &App {
             .split(area);
 
         // Title area
-        Paragraph::new("Calendar")
+        Paragraph::new(self.title())
             .centered()
             .style(Modifier::BOLD)
             .render(main_chunks[0], buf);
