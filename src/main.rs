@@ -1,4 +1,5 @@
-use chrono::{Datelike, Days, Local, Months, NaiveDate};
+mod calendar_auth;
+use chrono::{Datelike, Days, Local, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -6,7 +7,7 @@ use ratatui::{
     layout::Rect,
     layout::{Constraint, Direction, Layout},
     prelude::Stylize,
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     symbols,
     text::Text,
     widgets::{Block, Borders, Clear, Paragraph, Widget},
@@ -97,7 +98,6 @@ impl App {
             }
             grid.push(week_days);
         }
-
         grid
     }
 
