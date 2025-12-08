@@ -9,7 +9,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::Text,
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use std::io;
 use std::iter;
@@ -18,7 +18,8 @@ use std::iter;
 struct App {
     cursor_x: usize,
     cursor_y: usize,
-    // tasks_visible: bool,
+    tasks_visible: bool,
+    events_visible: bool,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     exit: bool,
@@ -32,7 +33,8 @@ impl App {
             cursor_y: 1,
             current_date: today,
             today: today,
-            // tasks_visible: false,
+            tasks_visible: false,
+            events_visible: false,
             exit: false,
         }
     }
@@ -46,7 +48,7 @@ impl App {
     }
 
     pub fn title(&self) -> String {
-        self.today.format("%D %B %Y").to_string()
+        self.current_date.format("%D %B %Y").to_string()
     }
 
     fn first_day_of_month(&self) -> NaiveDate {
@@ -74,6 +76,8 @@ impl App {
             KeyCode::Right => self.move_right(),
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
+            KeyCode::Char('E') => self.toggle_event_visibility(),
+            KeyCode::Char('T') => self.toggle_tasks_visibility(),
             _ => {}
         }
     }
@@ -91,7 +95,7 @@ impl App {
                 self.cursor_y += 1;
             }
         }
-        self.today = self.today.checked_add_days(Days::new(1)).unwrap();
+        self.current_date = self.current_date.succ_opt().unwrap();
     }
 
     fn move_left(&mut self) {
@@ -103,7 +107,7 @@ impl App {
                 self.cursor_y -= 1;
             }
         }
-        self.today = self.today.checked_sub_days(Days::new(1)).unwrap();
+        self.current_date = self.current_date.pred_opt().unwrap();
     }
 
     fn move_up(&mut self) {
@@ -112,7 +116,7 @@ impl App {
         } else {
             self.cursor_y = 4;
         }
-        self.today = self.today.checked_sub_days(Days::new(7)).unwrap();
+        self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
     }
 
     fn move_down(&mut self) {
@@ -121,7 +125,14 @@ impl App {
         } else {
             self.cursor_y = 0;
         }
-        self.today = self.today.checked_add_days(Days::new(7)).unwrap();
+        self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
+    }
+
+    fn toggle_event_visibility(&mut self) {
+        self.events_visible = !self.events_visible;
+    }
+    fn toggle_tasks_visibility(&mut self) {
+        self.tasks_visible = !self.tasks_visible;
     }
 }
 
@@ -134,14 +145,24 @@ fn main() -> Result<(), io::Error> {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let main_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(3),
-                Constraint::Fill(1),
-                Constraint::Percentage(3),
-            ])
-            .split(area);
+        let main_area = if self.tasks_visible {
+            Layout::new(
+                Direction::Horizontal,
+                Constraint::from_percentages([70, 30]),
+            )
+            .split(area)
+        } else {
+            Layout::new(
+                Direction::Horizontal,
+                Constraint::from_percentages([100, 0]),
+            )
+            .split(area)
+        };
+        let main_chunks = Layout::new(
+            Direction::Vertical,
+            [Constraint::Percentage(3), Constraint::Fill(1)],
+        )
+        .split(main_area[0]);
 
         // Title area
         Paragraph::new(self.title())
@@ -153,7 +174,7 @@ impl Widget for &App {
         let calendar_area = main_chunks[1];
         let calendar_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(Constraint::from_percentages([7, 17, 17, 17, 17, 17]))
+            .constraints(Constraint::from_percentages([8, 18, 18, 18, 18, 18]))
             .split(calendar_area);
 
         // Calendar Header
@@ -234,7 +255,7 @@ impl Widget for &App {
                     // Sunday
                     let day = day.red();
                     // let name = Text::styled(day, Style::default().fg(Color::Red));
-                    let cell = Paragraph::new(day).style(Modifier::BOLD);
+                    let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
                     let day_block = if row_index == 4 {
                         day_block
@@ -245,7 +266,7 @@ impl Widget for &App {
                 } else if col_index == 6 {
                     // Saturday
                     let day = day.blue();
-                    let cell = Paragraph::new(day).style(Modifier::BOLD);
+                    let cell = Paragraph::new(day);
                     let day_block =
                         cell_border.borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT);
                     let day_block = if row_index == 4 {
@@ -256,7 +277,7 @@ impl Widget for &App {
                     cell.block(day_block).render(*cell_chunk, buf)
                 } else {
                     // Weekdays
-                    let cell = Paragraph::new(day).style(Modifier::BOLD);
+                    let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
 
                     let day_block = if row_index == 4 {
@@ -268,10 +289,34 @@ impl Widget for &App {
                 }
             }
         }
-        // Add instructions at the bottom
-        Paragraph::new("Use arrow keys to move cursor | Press 'q' to quit")
-            .centered()
-            .style(Style::default().fg(Color::Yellow))
-            .render(main_chunks[2], buf);
+        if self.events_visible {
+            let event_area_horizontal = Layout::new(
+                Direction::Vertical,
+                Constraint::from_percentages([18, 64, 18]),
+            )
+            .split(main_area[0]);
+            let event_area = Layout::new(
+                Direction::Horizontal,
+                Constraint::from_percentages([30, 40, 30]),
+            )
+            .split(event_area_horizontal[1]);
+            Clear::default().render(event_area[1], buf);
+            Block::bordered()
+                .title("Events".bold().into_centered_line())
+                .render(event_area[1], buf);
+        }
+
+        if self.tasks_visible {
+            let task_area = Layout::new(
+                Direction::Vertical,
+                Constraint::from_percentages([2, 96, 2]),
+            )
+            .margin(4)
+            .split(main_area[1]);
+            // Clear::default().render(event_area[1], buf);
+            Block::bordered()
+                .title("Tasks".bold().into_centered_line())
+                .render(task_area[1], buf);
+        }
     }
 }
