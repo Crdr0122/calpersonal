@@ -16,8 +16,6 @@ use std::iter;
 
 // Struct to hold our application state
 struct App {
-    cursor_x: usize,
-    cursor_y: usize,
     tasks_visible: bool,
     events_visible: bool,
     current_date: NaiveDate, // The date being displayed
@@ -29,8 +27,6 @@ impl App {
     fn new() -> App {
         let today = Local::now().date_naive();
         App {
-            cursor_x: 0,
-            cursor_y: 1,
             current_date: today,
             today: today,
             tasks_visible: false,
@@ -55,8 +51,54 @@ impl App {
         NaiveDate::from_ymd_opt(self.current_date.year(), self.current_date.month(), 1).unwrap()
     }
 
+    fn last_day_of_month(&self) -> NaiveDate {
+        let (year, month) = (self.current_date.year(), self.current_date.month());
+        let last_day = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1)
+        }
+        .unwrap()
+        .pred_opt()
+        .unwrap();
+        last_day
+    }
+
     fn draw(&self, frame: &mut Frame) {
         frame.render_widget(self, frame.area());
+    }
+
+    fn generate_calendar_grid(&self) -> Vec<Vec<(u32, bool, bool)>> {
+        let first_day = self.first_day_of_month();
+        let current_month = self.current_date.month();
+
+        // Get weekday of first day (0 = Sunday, 6 = Saturday)
+        let first_weekday = first_day.weekday().num_days_from_sunday() as i32;
+
+        // Calculate starting date (might be from previous month)
+        let start_date = first_day - chrono::Duration::days(first_weekday as i64);
+
+        let mut grid = Vec::new();
+
+        // Generate 6 weeks (42 days total)
+        for week in 0..6 {
+            let mut week_days = Vec::new();
+            for day in 0..7 {
+                let drawing_date = start_date + chrono::Duration::days((week * 7 + day) as i64);
+                let day_number = drawing_date.day();
+
+                // Check if this date is in the current month
+                let is_current_month = drawing_date.month() == current_month;
+
+                // Check if this date is today
+                let is_today = drawing_date == self.today;
+
+                week_days.push((day_number, is_current_month, is_today));
+            }
+            grid.push(week_days);
+        }
+
+        grid
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -87,44 +129,18 @@ impl App {
     }
 
     fn move_right(&mut self) {
-        if self.cursor_x < 6 {
-            self.cursor_x += 1;
-        } else {
-            self.cursor_x = 0;
-            if self.cursor_y < 4 {
-                self.cursor_y += 1;
-            }
-        }
         self.current_date = self.current_date.succ_opt().unwrap();
     }
 
     fn move_left(&mut self) {
-        if self.cursor_x > 0 {
-            self.cursor_x -= 1;
-        } else {
-            self.cursor_x = 6;
-            if self.cursor_y > 0 {
-                self.cursor_y -= 1;
-            }
-        }
         self.current_date = self.current_date.pred_opt().unwrap();
     }
 
     fn move_up(&mut self) {
-        if self.cursor_y > 0 {
-            self.cursor_y -= 1;
-        } else {
-            self.cursor_y = 4;
-        }
         self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
     }
 
     fn move_down(&mut self) {
-        if self.cursor_y < 4 {
-            self.cursor_y += 1;
-        } else {
-            self.cursor_y = 0;
-        }
         self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
     }
 
@@ -158,11 +174,8 @@ impl Widget for &App {
             )
             .split(area)
         };
-        let main_chunks = Layout::new(
-            Direction::Vertical,
-            [Constraint::Percentage(3), Constraint::Fill(1)],
-        )
-        .split(main_area[0]);
+        let main_chunks = Layout::new(Direction::Vertical, Constraint::from_percentages([3, 97]))
+            .split(main_area[0]);
 
         // Title area
         Paragraph::new(self.title())
@@ -174,7 +187,15 @@ impl Widget for &App {
         let calendar_area = main_chunks[1];
         let calendar_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(Constraint::from_percentages([8, 18, 18, 18, 18, 18]))
+            .constraints(Constraint::from_ratios([
+                (1, 14),
+                (1, 6),
+                (1, 6),
+                (1, 6),
+                (1, 6),
+                (1, 6),
+                (1, 6),
+            ]))
             .split(calendar_area);
 
         // Calendar Header
@@ -234,7 +255,10 @@ impl Widget for &App {
         }
 
         // Days Area
-        for (row_index, row_chunk) in calendar_rows[1..6].iter().enumerate() {
+        let drawn_dates = self.generate_calendar_grid();
+        let cursor_date = self.current_date.day();
+
+        for (row_index, row_chunk) in calendar_rows[1..7].iter().enumerate() {
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(Constraint::from_ratios(iter::repeat_n((1, 7), 7)))
@@ -243,21 +267,26 @@ impl Widget for &App {
             // Draw each cell in this row
             for (col_index, cell_chunk) in horizontal_chunks.iter().enumerate() {
                 let cell_border = Block::default();
-                let is_cursor_here = row_index == self.cursor_y && col_index == self.cursor_x;
-                let day_number = 3;
+                let current_cell = drawn_dates[row_index][col_index];
+                let is_cursor_here = cursor_date == current_cell.0 && current_cell.1;
                 let day = if is_cursor_here {
-                    Text::raw(format!("{}{:<30}", day_number, " ")).on_dark_gray()
+                    Text::raw(format!("{}{:<30}", current_cell.0, " ")).on_dark_gray()
                 } else {
-                    Text::raw(format!("{}", day_number))
+                    Text::raw(format!("{}", current_cell.0))
                 };
 
                 if col_index == 0 {
                     // Sunday
-                    let day = day.red();
-                    // let name = Text::styled(day, Style::default().fg(Color::Red));
+                    let day = if current_cell.2 {
+                        day.green()
+                    } else if current_cell.1 {
+                        day.red()
+                    } else {
+                        day.dark_gray()
+                    };
                     let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
-                    let day_block = if row_index == 4 {
+                    let day_block = if row_index == 5 {
                         day_block
                     } else {
                         day_block.border_set(left_bottom_border)
@@ -265,11 +294,17 @@ impl Widget for &App {
                     cell.block(day_block).render(*cell_chunk, buf)
                 } else if col_index == 6 {
                     // Saturday
-                    let day = day.blue();
+                    let day = if current_cell.2 {
+                        day.green()
+                    } else if current_cell.1 {
+                        day.blue()
+                    } else {
+                        day.dark_gray()
+                    };
                     let cell = Paragraph::new(day);
                     let day_block =
                         cell_border.borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT);
-                    let day_block = if row_index == 4 {
+                    let day_block = if row_index == 5 {
                         day_block.border_set(left_border)
                     } else {
                         day_block.border_set(right_bottom_border)
@@ -277,10 +312,18 @@ impl Widget for &App {
                     cell.block(day_block).render(*cell_chunk, buf)
                 } else {
                     // Weekdays
+                    let day = if current_cell.2 {
+                        day.green()
+                    } else if current_cell.1 {
+                        day
+                    } else {
+                        day.dark_gray()
+                    };
+
                     let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
 
-                    let day_block = if row_index == 4 {
+                    let day_block = if row_index == 5 {
                         day_block.border_set(left_border)
                     } else {
                         day_block.border_set(left_bottom_border_cross)
@@ -313,7 +356,6 @@ impl Widget for &App {
             )
             .margin(4)
             .split(main_area[1]);
-            // Clear::default().render(event_area[1], buf);
             Block::bordered()
                 .title("Tasks".bold().into_centered_line())
                 .render(task_area[1], buf);
