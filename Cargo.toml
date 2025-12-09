@@ -6,11 +6,14 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.42"
 crossterm = "0.29.0"
+dirs = "6.0.0"
 google-calendar3 = "6.0.0"
 hyper = "1.8.1"
-hyper-rustls = "0.27.7"
+hyper-rustls = "0.27"
+hyper-util = { version = "0.1", features = ["client", "http1"] }
 ratatui = "0.29.0"
-tokio = { version = "1", features = ["full"] }
+rustls = "0.23.35"
 serde = "1.0.228"
 serde_json = "1.0.145"
+tokio = { version = "1", features = ["full"] }
 yup-oauth2 = "12.1.1"

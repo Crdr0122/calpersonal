@@ -39,7 +39,7 @@ impl App {
         let today = Local::now().date_naive();
         let hub = match calendar_auth::get_calendar_hub().await {
             Ok(h) => {
-                println!("✓ Connected to Google Calendar");
+                // println!("✓ Connected to Google Calendar");
                 Some(h)
             }
             Err(e) => {
@@ -71,7 +71,7 @@ impl App {
     }
 
     pub fn title(&self) -> String {
-        self.current_date.format("%D %B %Y").to_string()
+        self.current_date.format("%d %B %Y").to_string()
     }
 
     fn first_day_of_month(&self) -> NaiveDate {
@@ -91,8 +91,9 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn generate_calendar_grid(&self) -> Vec<Vec<(u32, bool, bool)>> {
+    fn generate_calendar_grid(&self) -> (Vec<Vec<(u32, bool, bool)>>, usize) {
         let first_day = self.first_day_of_month();
+        let last_day = self.last_day_of_month();
         let current_month = self.current_date.month();
 
         // Get weekday of first day (0 = Sunday, 6 = Saturday)
@@ -100,6 +101,14 @@ impl App {
 
         // Calculate starting date (might be from previous month)
         let start_date = first_day - chrono::Duration::days(first_weekday as i64);
+        let number_of_days = last_day.signed_duration_since(start_date).num_days();
+        let number_of_rows = if number_of_days > 34 {
+            6
+        } else if number_of_days < 29 {
+            4
+        } else {
+            5
+        };
 
         let mut grid = Vec::new();
 
@@ -119,7 +128,7 @@ impl App {
             }
             grid.push(week_days);
         }
-        grid
+        (grid, number_of_rows)
     }
 
     async fn refresh_events_for_current_month(&mut self) {
@@ -131,23 +140,23 @@ impl App {
         self.events_cache.clear();
 
         let hub = self.hub.as_ref().unwrap();
-        let first = self.first_day_of_month();
-        let last = self.last_day_of_month() + chrono::Duration::days(1); // inclusive end
+        // let first = self.first_day_of_month();
+        // let last = self.last_day_of_month() + chrono::Duration::days(1); // inclusive end
 
-        let time_min = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            first.and_hms_opt(0, 0, 0).unwrap(),
-            chrono::Utc,
-        );
-        let time_max = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            last.and_hms_opt(0, 0, 0).unwrap(),
-            chrono::Utc,
-        );
+        // let time_min = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        //     first.and_hms_opt(0, 0, 0).unwrap(),
+        //     chrono::Utc,
+        // );
+        // let time_max = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        //     last.and_hms_opt(0, 0, 0).unwrap(),
+        //     chrono::Utc,
+        // );
 
         match hub
             .events()
             .list("primary")
-            .time_min(time_min)
-            .time_max(time_max)
+            // .time_min(time_min)
+            // .time_max(time_max)
             .single_events(true)
             .order_by("startTime")
             .doit()
@@ -179,6 +188,14 @@ impl App {
         }
 
         self.events_loading = false;
+    }
+
+    async fn navigate_and_refresh(&mut self, new_date: NaiveDate) {
+        let month_changed = new_date.month() != self.current_date.month();
+        self.current_date = new_date;
+        if month_changed && self.hub.is_some() {
+            self.refresh_events_for_current_month().await;
+        }
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -258,24 +275,21 @@ impl Widget for &App {
 
         // Calendar area
         let calendar_area = main_chunks[1];
+        let (drawn_dates, number_of_rows) = self.generate_calendar_grid();
+
+        let mut calendar_row_constraints =
+            vec![Constraint::Ratio(1, number_of_rows.try_into().unwrap()); number_of_rows];
+        calendar_row_constraints.insert(0, Constraint::Ratio(1, 14));
         let calendar_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(Constraint::from_ratios([
-                (1, 14),
-                (1, 6),
-                (1, 6),
-                (1, 6),
-                (1, 6),
-                (1, 6),
-                (1, 6),
-            ]))
+            .constraints(calendar_row_constraints)
             .split(calendar_area);
 
         // Calendar Header
         let weekday_area = calendar_rows[0];
         let weekday_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(Constraint::from_ratios(iter::repeat_n((1, 7), 7)))
+            .constraints([Constraint::Ratio(1, 7); 7])
             .split(weekday_area);
 
         let left_bottom_border_cross = symbols::border::Set {
@@ -328,13 +342,12 @@ impl Widget for &App {
         }
 
         // Days Area
-        let drawn_dates = self.generate_calendar_grid();
         let cursor_date = self.current_date.day();
 
-        for (row_index, row_chunk) in calendar_rows[1..7].iter().enumerate() {
+        for (row_index, row_chunk) in calendar_rows[1..(number_of_rows + 1)].iter().enumerate() {
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints(Constraint::from_ratios(iter::repeat_n((1, 7), 7)))
+                .constraints([Constraint::Ratio(1, 7); 7])
                 .split(*row_chunk);
 
             // Draw each cell in this row
@@ -359,7 +372,7 @@ impl Widget for &App {
                     };
                     let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
-                    let day_block = if row_index == 5 {
+                    let day_block = if row_index == number_of_rows - 1 {
                         day_block
                     } else {
                         day_block.border_set(left_bottom_border)
@@ -377,7 +390,7 @@ impl Widget for &App {
                     let cell = Paragraph::new(day);
                     let day_block =
                         cell_border.borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT);
-                    let day_block = if row_index == 5 {
+                    let day_block = if row_index == number_of_rows - 1 {
                         day_block.border_set(left_border)
                     } else {
                         day_block.border_set(right_bottom_border)
@@ -396,7 +409,7 @@ impl Widget for &App {
                     let cell = Paragraph::new(day);
                     let day_block = cell_border.borders(Borders::BOTTOM | Borders::LEFT);
 
-                    let day_block = if row_index == 5 {
+                    let day_block = if row_index == number_of_rows - 1 {
                         day_block.border_set(left_border)
                     } else {
                         day_block.border_set(left_bottom_border_cross)
@@ -413,16 +426,12 @@ impl Widget for &App {
             .split(main_area[0]);
             let event_area = Layout::new(
                 Direction::Horizontal,
-                Constraint::from_percentages([30, 40, 30]),
+                Constraint::from_percentages([20, 60, 20]),
             )
             .split(event_area_horizontal[1]);
             Clear::default().render(event_area[1], buf);
-            // Block::bordered()
-            //     .title("Events".bold().into_centered_line())
-            //     .render(event_area[1], buf);
 
             let empty_vec = &vec![];
-
             let today_events = self
                 .events_cache
                 .get(&self.current_date)
@@ -441,12 +450,9 @@ impl Widget for &App {
                             .start
                             .as_ref()
                             .and_then(|s| s.date_time)
-                            .map(|dt| {
-                                // let local = chrono::DateTime::parse_from_rfc3339(dt).unwrap();
-                                dt.format("%H:%M").to_string()
-                            })
-                            .unwrap_or("All day".to_string());
-                        ratatui::widgets::ListItem::new(format!("{time} {title}"))
+                            .map(|dt| dt.format(" %H:%M ").to_string())
+                            .unwrap_or(" ".to_string());
+                        ratatui::widgets::ListItem::new(format!("{time}{title}"))
                     })
                     .collect()
             };
