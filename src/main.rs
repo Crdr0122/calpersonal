@@ -1,6 +1,9 @@
 mod calendar_auth;
-use chrono::{Datelike, Days, Local, NaiveDate};
+use chrono::{Datelike, Days, Local, Months, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use google_calendar3::{CalendarHub, api};
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -12,6 +15,8 @@ use ratatui::{
     text::Text,
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use rustls;
+use std::collections::HashMap;
 use std::io;
 use std::iter;
 
@@ -22,18 +27,39 @@ struct App {
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     exit: bool,
+
+    // Calendar stuff
+    hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
+    events_cache: HashMap<NaiveDate, Vec<api::Event>>,                // date → events that day
+    events_loading: bool,
 }
 
 impl App {
-    fn new() -> App {
+    async fn new() -> App {
         let today = Local::now().date_naive();
-        App {
+        let hub = match calendar_auth::get_calendar_hub().await {
+            Ok(h) => {
+                println!("✓ Connected to Google Calendar");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("Google Calendar offline: {e}");
+                None
+            }
+        };
+        let mut app = Self {
             current_date: today,
             today: today,
             tasks_visible: false,
             events_visible: false,
             exit: false,
-        }
+
+            hub,
+            events_cache: HashMap::new(),
+            events_loading: false,
+        };
+        app.refresh_events_for_current_month().await;
+        app
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
@@ -53,16 +79,12 @@ impl App {
     }
 
     fn last_day_of_month(&self) -> NaiveDate {
-        let (year, month) = (self.current_date.year(), self.current_date.month());
-        let last_day = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1)
-        }
-        .unwrap()
-        .pred_opt()
-        .unwrap();
-        last_day
+        let first_day = self.first_day_of_month();
+        first_day
+            .checked_add_months(Months::new(1))
+            .unwrap()
+            .pred_opt()
+            .unwrap()
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -93,12 +115,70 @@ impl App {
 
                 // Check if this date is today
                 let is_today = drawing_date == self.today;
-
                 week_days.push((day_number, is_current_month, is_today));
             }
             grid.push(week_days);
         }
         grid
+    }
+
+    async fn refresh_events_for_current_month(&mut self) {
+        if self.hub.is_none() {
+            return;
+        }
+
+        self.events_loading = true;
+        self.events_cache.clear();
+
+        let hub = self.hub.as_ref().unwrap();
+        let first = self.first_day_of_month();
+        let last = self.last_day_of_month() + chrono::Duration::days(1); // inclusive end
+
+        let time_min = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            first.and_hms_opt(0, 0, 0).unwrap(),
+            chrono::Utc,
+        );
+        let time_max = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            last.and_hms_opt(0, 0, 0).unwrap(),
+            chrono::Utc,
+        );
+
+        match hub
+            .events()
+            .list("primary")
+            .time_min(time_min)
+            .time_max(time_max)
+            .single_events(true)
+            .order_by("startTime")
+            .doit()
+            .await
+        {
+            Ok((_, events_list)) => {
+                if let Some(items) = events_list.items {
+                    for event in items {
+                        let start_date = if let Some(start) = &event.start {
+                            if let Some(date_time_str) = start.date_time {
+                                // Full timestamp → convert to local NaiveDate
+                                Some(date_time_str.date_naive())
+                            } else if let Some(date_str) = start.date {
+                                // All-day event → just YYYY-MM-DD
+                                Some(date_str)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(date) = start_date {
+                            self.events_cache.entry(date).or_default().push(event);
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to fetch events: {e:?}"),
+        }
+
+        self.events_loading = false;
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -150,13 +230,6 @@ impl App {
     fn toggle_tasks_visibility(&mut self) {
         self.tasks_visible = !self.tasks_visible;
     }
-}
-
-fn main() -> Result<(), io::Error> {
-    let mut terminal = ratatui::init();
-    let res = App::new().run(&mut terminal);
-    ratatui::restore();
-    res
 }
 
 impl Widget for &App {
@@ -344,8 +417,42 @@ impl Widget for &App {
             )
             .split(event_area_horizontal[1]);
             Clear::default().render(event_area[1], buf);
-            Block::bordered()
-                .title("Events".bold().into_centered_line())
+            // Block::bordered()
+            //     .title("Events".bold().into_centered_line())
+            //     .render(event_area[1], buf);
+
+            let empty_vec = &vec![];
+
+            let today_events = self
+                .events_cache
+                .get(&self.current_date)
+                .unwrap_or(empty_vec);
+
+            let items: Vec<ratatui::widgets::ListItem> = if self.events_loading {
+                vec![ratatui::widgets::ListItem::new("Loading events...")]
+            } else if today_events.is_empty() {
+                vec![ratatui::widgets::ListItem::new("No events today")]
+            } else {
+                today_events
+                    .iter()
+                    .map(|ev| {
+                        let title = ev.summary.as_deref().unwrap_or("Untitled");
+                        let time = ev
+                            .start
+                            .as_ref()
+                            .and_then(|s| s.date_time)
+                            .map(|dt| {
+                                // let local = chrono::DateTime::parse_from_rfc3339(dt).unwrap();
+                                dt.format("%H:%M").to_string()
+                            })
+                            .unwrap_or("All day".to_string());
+                        ratatui::widgets::ListItem::new(format!("{time} {title}"))
+                    })
+                    .collect()
+            };
+
+            ratatui::widgets::List::new(items)
+                .block(Block::bordered().title("Events today"))
                 .render(event_area[1], buf);
         }
 
@@ -361,4 +468,17 @@ impl Widget for &App {
                 .render(task_area[1], buf);
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), io::Error> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install awc_ls_rs crypto provider");
+
+    let mut terminal = ratatui::init();
+    let mut calendar_init = App::new().await;
+    let res = calendar_init.run(&mut terminal);
+    ratatui::restore();
+    res
 }
