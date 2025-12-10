@@ -312,8 +312,11 @@ impl Widget for &App {
             )
             .split(area)
         };
-        let main_chunks = Layout::new(Direction::Vertical, Constraint::from_percentages([3, 97]))
-            .split(main_area[0]);
+        let main_chunks = Layout::new(
+            Direction::Vertical,
+            Constraint::from_percentages([3, 94, 3]),
+        )
+        .split(main_area[0]);
 
         // Title area
         Paragraph::new(self.title())
@@ -324,10 +327,10 @@ impl Widget for &App {
         // Calendar area
         let calendar_area = main_chunks[1];
         let (drawn_dates, number_of_rows) = self.generate_calendar_grid();
+        let height = (calendar_area.height as usize) / (number_of_rows);
 
-        let mut calendar_row_constraints =
-            vec![Constraint::Ratio(1, number_of_rows.try_into().unwrap()); number_of_rows];
-        calendar_row_constraints.insert(0, Constraint::Ratio(1, 14));
+        let mut calendar_row_constraints = vec![Constraint::Length(height as u16); number_of_rows];
+        calendar_row_constraints.insert(0, Constraint::Length(calendar_area.height / 11));
         let calendar_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(calendar_row_constraints)
