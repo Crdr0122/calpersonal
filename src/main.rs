@@ -1,7 +1,9 @@
 mod calendar_auth;
-use chrono::{Datelike, Days, Local, Months, NaiveDate};
+mod tasks_auth;
+use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use google_calendar3::{CalendarHub, api};
+use google_tasks1::TasksHub;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect;
 use ratatui::{
@@ -18,7 +20,6 @@ use ratatui::{
 use rustls;
 use std::collections::HashMap;
 use std::io;
-use std::iter;
 
 // Struct to hold our application state
 struct App {
@@ -26,24 +27,33 @@ struct App {
     events_visible: bool,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
+    cursor_line: u32,
     exit: bool,
 
     // Calendar stuff
-    hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    events_cache: HashMap<NaiveDate, Vec<api::Event>>,                // date → events that day
+    event_hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
+    events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
     events_loading: bool,
+
+    task_hub: Option<TasksHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
+    tasks_cache: Vec<google_tasks1::api::Task>,                         // date → events that day
+    tasks_loading: bool,
 }
 
 impl App {
     async fn new() -> App {
         let today = Local::now().date_naive();
-        let hub = match calendar_auth::get_calendar_hub().await {
-            Ok(h) => {
-                // println!("✓ Connected to Google Calendar");
-                Some(h)
-            }
+        let event_hub = match calendar_auth::get_calendar_hub().await {
+            Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("Google Calendar offline: {e}");
+                None
+            }
+        };
+        let task_hub = match tasks_auth::get_tasks_hub().await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("Google Tasks offline: {e}");
                 None
             }
         };
@@ -52,20 +62,25 @@ impl App {
             today: today,
             tasks_visible: false,
             events_visible: false,
+            cursor_line: 1,
             exit: false,
 
-            hub,
+            event_hub: event_hub,
             events_cache: HashMap::new(),
             events_loading: false,
+
+            task_hub: task_hub,
+            tasks_cache: Vec::new(),
+            tasks_loading: false,
         };
-        app.refresh_events_for_current_month().await;
+        app.refresh_calendar_and_tasks().await;
         app
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+            let _ = self.handle_events();
         }
         Ok(())
     }
@@ -131,32 +146,51 @@ impl App {
         (grid, number_of_rows)
     }
 
-    async fn refresh_events_for_current_month(&mut self) {
-        if self.hub.is_none() {
+    async fn refresh_tasks(&mut self) {
+        if self.task_hub.is_none() {
+            return;
+        }
+        self.tasks_loading = true;
+        self.tasks_cache.clear();
+        let hub = self.task_hub.as_ref().unwrap();
+        let tasklists = match hub.tasklists().list().doit().await {
+            Ok((_, tasks_list)) => {
+                if let Some(items) = tasks_list.items {
+                    items
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+        for tasklist in tasklists {
+            match hub.tasks().list(&tasklist.id.unwrap()).doit().await {
+                Ok((_, tasks)) => {
+                    if let Some(items) = tasks.items {
+                        for task in items {
+                            self.tasks_cache.push(task);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to fetch tasks: {e:?}"),
+            }
+        }
+        self.tasks_loading = false;
+    }
+
+    async fn refresh_events(&mut self) {
+        if self.event_hub.is_none() {
             return;
         }
 
         self.events_loading = true;
         self.events_cache.clear();
 
-        let hub = self.hub.as_ref().unwrap();
-        // let first = self.first_day_of_month();
-        // let last = self.last_day_of_month() + chrono::Duration::days(1); // inclusive end
-
-        // let time_min = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-        //     first.and_hms_opt(0, 0, 0).unwrap(),
-        //     chrono::Utc,
-        // );
-        // let time_max = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-        //     last.and_hms_opt(0, 0, 0).unwrap(),
-        //     chrono::Utc,
-        // );
+        let hub = self.event_hub.as_ref().unwrap();
 
         match hub
             .events()
             .list("primary")
-            // .time_min(time_min)
-            // .time_max(time_max)
             .single_events(true)
             .order_by("startTime")
             .doit()
@@ -167,10 +201,10 @@ impl App {
                     for event in items {
                         let start_date = if let Some(start) = &event.start {
                             if let Some(date_time_str) = start.date_time {
-                                // Full timestamp → convert to local NaiveDate
+                                // Full timestamp
                                 Some(date_time_str.date_naive())
                             } else if let Some(date_str) = start.date {
-                                // All-day event → just YYYY-MM-DD
+                                // All-day event
                                 Some(date_str)
                             } else {
                                 None
@@ -190,12 +224,9 @@ impl App {
         self.events_loading = false;
     }
 
-    async fn navigate_and_refresh(&mut self, new_date: NaiveDate) {
-        let month_changed = new_date.month() != self.current_date.month();
-        self.current_date = new_date;
-        if month_changed && self.hub.is_some() {
-            self.refresh_events_for_current_month().await;
-        }
+    async fn refresh_calendar_and_tasks(&mut self) {
+        self.refresh_events().await;
+        self.refresh_tasks().await;
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -217,6 +248,7 @@ impl App {
             KeyCode::Down => self.move_down(),
             KeyCode::Char('E') => self.toggle_event_visibility(),
             KeyCode::Char('T') => self.toggle_tasks_visibility(),
+            // KeyCode::Char('R') => self.refresh_calendar_and_tasks().await,
             _ => {}
         }
     }
@@ -226,26 +258,42 @@ impl App {
     }
 
     fn move_right(&mut self) {
+        if self.tasks_visible || self.events_visible {
+            return;
+        }
         self.current_date = self.current_date.succ_opt().unwrap();
     }
 
     fn move_left(&mut self) {
+        if self.tasks_visible || self.events_visible {
+            return;
+        }
         self.current_date = self.current_date.pred_opt().unwrap();
     }
 
     fn move_up(&mut self) {
+        if self.tasks_visible || self.events_visible {
+            self.cursor_line = self.cursor_line - 1;
+            return;
+        }
         self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
     }
 
     fn move_down(&mut self) {
+        if self.tasks_visible || self.events_visible {
+            self.cursor_line = self.cursor_line + 1;
+            return;
+        }
         self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
     }
 
     fn toggle_event_visibility(&mut self) {
         self.events_visible = !self.events_visible;
+        self.cursor_line = 1;
     }
     fn toggle_tasks_visibility(&mut self) {
         self.tasks_visible = !self.tasks_visible;
+        self.cursor_line = 1;
     }
 }
 
@@ -355,7 +403,8 @@ impl Widget for &App {
                 let cell_border = Block::default();
                 let current_cell = drawn_dates[row_index][col_index];
                 let is_cursor_here = cursor_date == current_cell.0 && current_cell.1;
-                let day = if is_cursor_here {
+                let focus_not_on_calendar = self.tasks_visible || self.events_visible;
+                let day = if is_cursor_here && (!focus_not_on_calendar) {
                     Text::raw(format!("{}{:<30}", current_cell.0, " ")).on_dark_gray()
                 } else {
                     Text::raw(format!("{}", current_cell.0))
@@ -421,7 +470,7 @@ impl Widget for &App {
         if self.events_visible {
             let event_area_horizontal = Layout::new(
                 Direction::Vertical,
-                Constraint::from_percentages([18, 64, 18]),
+                Constraint::from_percentages([16, 68, 16]),
             )
             .split(main_area[0]);
             let event_area = Layout::new(
@@ -440,7 +489,7 @@ impl Widget for &App {
             let items: Vec<ratatui::widgets::ListItem> = if self.events_loading {
                 vec![ratatui::widgets::ListItem::new("Loading events...")]
             } else if today_events.is_empty() {
-                vec![ratatui::widgets::ListItem::new("No events today")]
+                vec![]
             } else {
                 today_events
                     .iter()
@@ -458,7 +507,7 @@ impl Widget for &App {
             };
 
             ratatui::widgets::List::new(items)
-                .block(Block::bordered().title("Events today"))
+                .block(Block::bordered().title("Events"))
                 .render(event_area[1], buf);
         }
 
@@ -469,8 +518,31 @@ impl Widget for &App {
             )
             .margin(4)
             .split(main_area[1]);
-            Block::bordered()
-                .title("Tasks".bold().into_centered_line())
+
+            let tasks = self.tasks_cache.clone();
+            let items: Vec<ratatui::widgets::ListItem> = if self.tasks_loading {
+                vec![ratatui::widgets::ListItem::new("Loading Tasks")]
+            // } else if tasks.is_empty() {
+            //     vec![ratatui::widgets::ListItem::new("No Tasks")]
+            } else {
+                tasks
+                    .iter()
+                    .map(|ev| {
+                        let title = ev.title.as_deref().unwrap_or("Untitled");
+                        let time = match ev.due.as_deref() {
+                            Some(duedate) => match DateTime::parse_from_rfc3339(duedate) {
+                                Ok(e) => e.date_naive().format("%d/%m/%y").to_string(),
+                                Err(_) => "".to_string(),
+                            },
+                            None => "".to_string(),
+                        };
+                        ratatui::widgets::ListItem::new(format!("{time} {title}"))
+                    })
+                    .collect()
+            };
+
+            ratatui::widgets::List::new(items)
+                .block(Block::bordered().title("Tasks".bold().into_centered_line()))
                 .render(task_area[1], buf);
         }
     }

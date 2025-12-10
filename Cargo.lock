@@ -100,6 +100,7 @@ dependencies = [
  "crossterm 0.29.0",
  "dirs",
  "google-calendar3",
+ "google-tasks1",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -599,6 +600,26 @@ name = "google-calendar3"
 version = "6.0.0+20240523"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eecfc108ae1dc04a710b8db3a79e15ab3e87bda7735e0f84df9bf4d4e1496cf6"
+dependencies = [
+ "chrono",
+ "google-apis-common",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "mime",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tokio",
+ "url",
+ "yup-oauth2 11.0.0",
+]
+
+[[package]]
+name = "google-tasks1"
+version = "6.0.0+20240625"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4dcdc28fc6b2268d6d40a9740acd28bb3f7bfd05cc5d39ec3c84ad3245f48db"
 dependencies = [
  "chrono",
  "google-apis-common",
