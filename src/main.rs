@@ -23,6 +23,7 @@ use rustls;
 use std::collections::HashMap;
 use std::io;
 use std::sync::LazyLock;
+use tokio::sync::oneshot;
 
 static APP_TIMEZONE: LazyLock<Tz> =
     LazyLock::new(|| "Asia/Tokyo".parse().expect("Invalid Timezone"));
@@ -46,18 +47,47 @@ struct App {
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<google_tasks1::api::Task>>>,
-    // rt_handle: tokio::runtime::Handle, // For spawning async from sync contexts
+    rt_handle: tokio::runtime::Handle,
     needs_refresh: bool,
+
+    auth_status: AuthStatus, // We'll define this enum
+
+    // Channels to receive hubs when auth completes
+    calendar_hub_rx: Option<
+        tokio::sync::oneshot::Receiver<Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>>,
+    >,
+    tasks_hub_rx: Option<
+        tokio::sync::oneshot::Receiver<Option<TasksHub<HttpsConnector<connect::HttpConnector>>>>,
+    >,
+}
+
+#[derive(PartialEq)]
+enum AuthStatus {
+    NotStarted,
+    Authenticating,
+    Online,
+    Offline, // Failed or no internet
 }
 
 impl App {
     async fn new() -> App {
         let today = Local::now().date_naive();
-        let event_hub = calendar_auth::get_calendar_hub().await.ok();
-        let task_hub = tasks_auth::get_tasks_hub().await.ok();
+        // let event_hub = calendar_auth::get_calendar_hub().await.ok();
+        // let task_hub = tasks_auth::get_tasks_hub().await.ok();
         let events_cache = file_writing::load_events_cache();
         let tasks_cache = file_writing::load_tasks_cache();
-        // let rt_handle = tokio::runtime::Handle::current();
+        let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
+        let (tasks_tx, tasks_rx) = tokio::sync::oneshot::channel();
+        let rt_handle = tokio::runtime::Handle::current();
+        rt_handle.spawn(async move {
+            let hub = calendar_auth::get_calendar_hub().await.ok();
+            let _ = calendar_tx.send(hub);
+        });
+
+        rt_handle.spawn(async move {
+            let hub = tasks_auth::get_tasks_hub().await.ok();
+            let _ = tasks_tx.send(hub);
+        });
         let mut app = Self {
             current_date: today,
             today: today,
@@ -66,20 +96,23 @@ impl App {
             cursor_line: 0,
             exit: false,
 
-            event_hub: event_hub,
+            event_hub: None,
             events_cache,
             events_loading: false,
 
-            task_hub: task_hub,
+            task_hub: None,
             tasks_cache,
             task_or_event_num: 0,
 
             events_update_rx: None,
             tasks_update_rx: None,
-            // rt_handle,
+            rt_handle,
             needs_refresh: false,
+
+            auth_status: AuthStatus::Authenticating,
+            calendar_hub_rx: Some(calendar_rx),
+            tasks_hub_rx: Some(tasks_rx),
         };
-        app.start_background_refresh();
         app
     }
 
@@ -165,6 +198,11 @@ impl App {
     }
 
     fn start_background_refresh(&mut self) {
+        self.start_background_event_fetch();
+        self.start_background_task_fetch();
+    }
+
+    fn start_background_event_fetch(&mut self) {
         if let Some(hub) = self.event_hub.clone() {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.events_update_rx = Some(rx);
@@ -176,9 +214,12 @@ impl App {
                 }
             });
         }
+    }
+    fn start_background_task_fetch(&mut self) {
         if let Some(hub) = self.task_hub.clone() {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.tasks_update_rx = Some(rx);
+            self.events_loading = true;
             tokio::spawn(async move {
                 if let Some(new_tasks) = App::fetch_tasks(&hub).await {
                     file_writing::save_tasks_cache(&new_tasks);
@@ -200,6 +241,36 @@ impl App {
             }
         }
         self.events_loading = false;
+
+        if let Some(rx) = &mut self.calendar_hub_rx {
+            if let Ok(hub) = rx.try_recv() {
+                self.event_hub = hub;
+                if self.event_hub.is_some() {
+                    self.start_background_event_fetch();
+                }
+                self.update_auth_status();
+                self.calendar_hub_rx = None;
+            }
+        }
+
+        if let Some(rx) = &mut self.tasks_hub_rx {
+            if let Ok(hub) = rx.try_recv() {
+                self.task_hub = hub;
+                if self.task_hub.is_some() {
+                    self.start_background_task_fetch();
+                }
+                self.update_auth_status();
+                self.tasks_hub_rx = None;
+            }
+        }
+    }
+
+    fn update_auth_status(&mut self) {
+        if self.event_hub.is_some() || self.task_hub.is_some() {
+            self.auth_status = AuthStatus::Online;
+        } else {
+            self.auth_status = AuthStatus::Offline;
+        }
     }
 
     async fn fetch_events(
@@ -377,7 +448,7 @@ impl Widget for &App {
         // Title area
         let title_area = Layout::new(
             Direction::Horizontal,
-            Constraint::from_percentages([3, 94, 3]),
+            Constraint::from_percentages([8, 84, 8]),
         )
         .split(main_chunks[0]);
 
@@ -387,11 +458,19 @@ impl Widget for &App {
             .render(title_area[1], buf);
 
         if self.events_loading {
-            Paragraph::new("⟳")
-                .centered()
+            Paragraph::new(" ⟳")
                 .style(Modifier::BOLD)
                 .render(title_area[0], buf);
         }
+
+        let status_text = match self.auth_status {
+            AuthStatus::Authenticating => "Authenticating".yellow(),
+            AuthStatus::Online => "Online".green(),
+            AuthStatus::Offline => "Offline".dim(),
+            AuthStatus::NotStarted => "".into(),
+        };
+
+        Paragraph::new(status_text).render(title_area[2], buf);
 
         // Calendar area
         let calendar_area = main_chunks[1];
