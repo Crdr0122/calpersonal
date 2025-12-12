@@ -32,7 +32,7 @@ struct App {
     events_visible: bool,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
-    cursor_line: u16,
+    cursor_line: usize,
     exit: bool,
 
     // Calendar stuff
@@ -42,7 +42,6 @@ struct App {
 
     task_hub: Option<TasksHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     tasks_cache: Vec<google_tasks1::api::Task>,                         // date → events that day
-    task_or_event_num: u16,
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<google_tasks1::api::Task>>>,
@@ -97,7 +96,6 @@ impl App {
 
             task_hub: None,
             tasks_cache,
-            task_or_event_num: 0,
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -189,6 +187,52 @@ impl App {
             grid.push(week_days);
         }
         (grid, number_of_rows)
+    }
+
+    fn current_day_events(&self) -> &[api::Event] {
+        static EMPTY: Vec<api::Event> = Vec::new();
+        self.events_cache
+            .get(&self.current_date)
+            .map(|v| v.as_slice())
+            .unwrap_or(&EMPTY)
+    }
+
+    fn selected_event_index(&self) -> Option<usize> {
+        let events = self.current_day_events();
+        if events.is_empty() {
+            return None;
+        }
+
+        let idx = self.cursor_line;
+        if idx < events.len() {
+            Some(idx)
+        } else {
+            // Auto-clamp if cursor went too far (e.g. after deleting items)
+            Some(events.len().saturating_sub(1))
+        }
+    }
+
+    fn selected_event(&self) -> Option<&api::Event> {
+        let idx = self.selected_event_index()?;
+        self.current_day_events().get(idx)
+    }
+
+    fn selected_task_index(&self) -> Option<usize> {
+        if self.tasks_cache.is_empty() {
+            return None;
+        }
+
+        let idx = self.cursor_line;
+        if idx < self.tasks_cache.len() {
+            Some(idx)
+        } else {
+            Some(self.tasks_cache.len().saturating_sub(1))
+        }
+    }
+
+    fn selected_task(&self) -> Option<&google_tasks1::api::Task> {
+        let idx = self.selected_task_index()?;
+        self.tasks_cache.get(idx)
     }
 
     fn start_background_refresh(&mut self) {
@@ -399,9 +443,13 @@ impl App {
     }
 
     fn move_down(&mut self) {
-        if self.tasks_visible || self.events_visible {
-            if self.cursor_line < self.task_or_event_num {
-                self.cursor_line = self.cursor_line - 1;
+        if self.tasks_visible {
+            if self.cursor_line < self.tasks_cache.len() - 1 {
+                self.cursor_line = self.cursor_line + 1;
+            }
+        } else if self.events_visible {
+            if self.cursor_line < self.current_day_events().len() - 1 {
+                self.cursor_line = self.cursor_line + 1;
             }
         } else {
             self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
@@ -410,11 +458,11 @@ impl App {
 
     fn toggle_event_visibility(&mut self) {
         self.events_visible = !self.events_visible;
-        self.cursor_line = 1;
+        self.cursor_line = 0;
     }
     fn toggle_tasks_visibility(&mut self) {
         self.tasks_visible = !self.tasks_visible;
-        self.cursor_line = 1;
+        self.cursor_line = 0;
     }
 }
 
@@ -670,7 +718,8 @@ impl Widget for &App {
             } else {
                 today_events
                     .iter()
-                    .map(|ev| {
+                    .enumerate()
+                    .map(|(i, ev)| {
                         let title = ev.summary.as_deref().unwrap_or("Untitled");
                         let start_time = ev
                             .start
@@ -692,7 +741,13 @@ impl Widget for &App {
                                     .to_string()
                             })
                             .unwrap_or("".to_string());
-                        ratatui::widgets::ListItem::new(format!("{start_time}{end_time}{title}"))
+                        let mut item = ratatui::widgets::ListItem::new(format!(
+                            "{start_time}{end_time}{title}"
+                        ));
+                        if !self.tasks_visible && Some(i) == self.selected_event_index() {
+                            item = item.bg(Color::DarkGray).fg(Color::White);
+                        };
+                        item
                     })
                     .collect()
             };
@@ -703,18 +758,15 @@ impl Widget for &App {
         }
 
         if self.tasks_visible {
-            let task_area = Layout::new(
-                Direction::Vertical,
-                Constraint::from_percentages([100]),
-            )
-            .margin(4)
-            .split(main_area[1]);
+            let task_area = Layout::new(Direction::Vertical, Constraint::from_percentages([95, 5]))
+                .split(main_area[1]);
 
             let tasks = self.tasks_cache.clone();
             let items: Vec<Text> = {
                 tasks
                     .iter()
-                    .map(|ev| {
+                    .enumerate()
+                    .map(|(i, ev)| {
                         let title = ev.title.as_deref().unwrap_or("Untitled");
                         let time = match ev.due.as_deref() {
                             Some(duedate) => match DateTime::parse_from_rfc3339(duedate) {
@@ -723,17 +775,27 @@ impl Widget for &App {
                             },
                             None => "".to_string(),
                         };
-                        match ev.completed {
+                        let mut item = match ev.completed {
                             Some(_) => Text::raw(format!("{time}{title}")).dark_gray(),
                             None => Text::raw(format!("{time}{title}")),
-                        }
+                        };
+                        if Some(i) == self.selected_task_index() {
+                            item = item.bg(Color::DarkGray).fg(Color::White);
+                        };
+                        item
                     })
                     .collect()
             };
 
             ratatui::widgets::List::new(items)
                 .block(Block::bordered().title("Tasks".bold().into_centered_line()))
-                .render(task_area[0], buf);
+                .render(
+                    task_area[0].inner(ratatui::layout::Margin {
+                        vertical: 1,
+                        horizontal: 5,
+                    }),
+                    buf,
+                );
         }
     }
 }
