@@ -23,7 +23,6 @@ use rustls;
 use std::collections::HashMap;
 use std::io;
 use std::sync::LazyLock;
-use tokio::sync::oneshot;
 
 static APP_TIMEZONE: LazyLock<Tz> =
     LazyLock::new(|| "Asia/Tokyo".parse().expect("Invalid Timezone"));
@@ -47,7 +46,6 @@ struct App {
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<google_tasks1::api::Task>>>,
-    rt_handle: tokio::runtime::Handle,
     needs_refresh: bool,
 
     auth_status: AuthStatus, // We'll define this enum
@@ -63,7 +61,6 @@ struct App {
 
 #[derive(PartialEq)]
 enum AuthStatus {
-    NotStarted,
     Authenticating,
     Online,
     Offline, // Failed or no internet
@@ -72,8 +69,6 @@ enum AuthStatus {
 impl App {
     async fn new() -> App {
         let today = Local::now().date_naive();
-        // let event_hub = calendar_auth::get_calendar_hub().await.ok();
-        // let task_hub = tasks_auth::get_tasks_hub().await.ok();
         let events_cache = file_writing::load_events_cache();
         let tasks_cache = file_writing::load_tasks_cache();
         let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
@@ -88,7 +83,7 @@ impl App {
             let hub = tasks_auth::get_tasks_hub().await.ok();
             let _ = tasks_tx.send(hub);
         });
-        let mut app = Self {
+        let app = Self {
             current_date: today,
             today: today,
             tasks_visible: false,
@@ -106,7 +101,6 @@ impl App {
 
             events_update_rx: None,
             tasks_update_rx: None,
-            rt_handle,
             needs_refresh: false,
 
             auth_status: AuthStatus::Authenticating,
@@ -426,24 +420,25 @@ impl App {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let main_chunks = Layout::new(
+            Direction::Vertical,
+            Constraint::from_percentages([3, 94, 3]),
+        )
+        .split(area);
+
         let main_area = if self.tasks_visible {
             Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([70, 30]),
             )
-            .split(area)
+            .split(main_chunks[1])
         } else {
             Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([100, 0]),
             )
-            .split(area)
+            .split(main_chunks[1])
         };
-        let main_chunks = Layout::new(
-            Direction::Vertical,
-            Constraint::from_percentages([3, 94, 3]),
-        )
-        .split(main_area[0]);
 
         // Title area
         let title_area = Layout::new(
@@ -467,13 +462,12 @@ impl Widget for &App {
             AuthStatus::Authenticating => "Authenticating".yellow(),
             AuthStatus::Online => "Online".green(),
             AuthStatus::Offline => "Offline".dim(),
-            AuthStatus::NotStarted => "".into(),
         };
 
         Paragraph::new(status_text).render(title_area[2], buf);
 
         // Calendar area
-        let calendar_area = main_chunks[1];
+        let calendar_area = main_area[0];
         let (drawn_dates, number_of_rows) = self.generate_calendar_grid();
         let height = (calendar_area.height as usize) / (number_of_rows);
 
@@ -711,7 +705,7 @@ impl Widget for &App {
         if self.tasks_visible {
             let task_area = Layout::new(
                 Direction::Vertical,
-                Constraint::from_percentages([2, 96, 2]),
+                Constraint::from_percentages([100]),
             )
             .margin(4)
             .split(main_area[1]);
@@ -739,7 +733,7 @@ impl Widget for &App {
 
             ratatui::widgets::List::new(items)
                 .block(Block::bordered().title("Tasks".bold().into_centered_line()))
-                .render(task_area[1], buf);
+                .render(task_area[0], buf);
         }
     }
 }
