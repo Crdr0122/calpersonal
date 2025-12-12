@@ -44,19 +44,3 @@ pub async fn get_calendar_hub()
     // 6. Create and return the hub (generics inferred)
     Ok(CalendarHub::new(client, auth))
 }
-
-pub async fn test_connection(hub: &CalendarHub<HttpsConnector<connect::HttpConnector>>) -> bool {
-    match hub.calendars().get("primary").doit().await {
-        Ok((_, calendar)) => {
-            println!(
-                "YES! Connected as: {}",
-                calendar.summary.as_deref().unwrap_or("Unknown")
-            );
-            true
-        }
-        Err(e) => {
-            eprintln!("Not connected! Error: {e:?}");
-            false
-        }
-    }
-}
