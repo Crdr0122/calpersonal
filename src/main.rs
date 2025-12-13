@@ -16,7 +16,7 @@ use ratatui::{
     prelude::Stylize,
     style::{Color, Modifier},
     symbols,
-    text::Text,
+    text::{Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use rustls;
@@ -38,10 +38,14 @@ struct App {
     // Calendar stuff
     event_hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
-    events_loading: bool,
-
     task_hub: Option<TasksHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    tasks_cache: Vec<google_tasks1::api::Task>,                         // date → events that day
+    tasks_cache: Vec<google_tasks1::api::Task>,        // date → events that day
+
+    deletion_status: Option<String>,
+    deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    events_loading: bool,
+    refreshing_status: (String, usize),
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<google_tasks1::api::Task>>>,
@@ -73,6 +77,7 @@ impl App {
         let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
         let (tasks_tx, tasks_rx) = tokio::sync::oneshot::channel();
         let rt_handle = tokio::runtime::Handle::current();
+        let (deletion_feedback_tx, deletion_feedback_rx) = tokio::sync::mpsc::channel(8); // or 4, or even 1
         rt_handle.spawn(async move {
             let hub = calendar_auth::get_calendar_hub().await.ok();
             let _ = calendar_tx.send(hub);
@@ -92,10 +97,14 @@ impl App {
 
             event_hub: None,
             events_cache,
-            events_loading: false,
-
             task_hub: None,
             tasks_cache,
+            refreshing_status: ("".to_string(), 0),
+
+            events_loading: false,
+            deletion_feedback_tx: Some(deletion_feedback_tx),
+            deletion_feedback_rx: Some(deletion_feedback_rx),
+            deletion_status: None,
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -244,6 +253,7 @@ impl App {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.events_update_rx = Some(rx);
             self.events_loading = true;
+            self.refreshing_status = ("Refreshing".to_string(), 1);
             tokio::spawn(async move {
                 if let Some(new_events) = App::fetch_events(&hub).await {
                     file_writing::save_events_cache(&new_events);
@@ -257,6 +267,7 @@ impl App {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.tasks_update_rx = Some(rx);
             self.events_loading = true;
+            self.refreshing_status = ("Refreshing".to_string(), 1);
             tokio::spawn(async move {
                 if let Some(new_tasks) = App::fetch_tasks(&hub).await {
                     file_writing::save_tasks_cache(&new_tasks);
@@ -278,6 +289,7 @@ impl App {
             }
         }
         self.events_loading = false;
+        self.refreshing_status = ("".to_string(), 0);
 
         if let Some(rx) = &mut self.calendar_hub_rx {
             if let Ok(hub) = rx.try_recv() {
@@ -300,6 +312,19 @@ impl App {
                 self.tasks_hub_rx = None;
             }
         }
+
+        if let Some(rx) = &mut self.deletion_feedback_rx {
+            while let Ok(msg) = rx.try_recv() {
+                self.refreshing_status = (msg, 1);
+                // Auto-clear after 2 seconds
+                let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
+                let clear_tx = tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let _ = clear_tx.send("".to_string());
+                });
+            }
+        }
     }
 
     fn update_auth_status(&mut self) {
@@ -308,6 +333,64 @@ impl App {
         } else {
             self.auth_status = AuthStatus::Offline;
         }
+    }
+
+    fn delete_selected_event(&mut self) {
+        let Some(event) = self.selected_event().cloned() else {
+            return;
+        };
+
+        let Some(event_id) = event.id else {
+            return;
+        };
+
+        let Some(hub) = self.event_hub.as_ref().cloned() else {
+            self.refreshing_status = ("Offline".to_string(), 2);
+            return;
+        };
+
+        let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
+        self.refreshing_status = ("Deleting".to_string(), 1);
+
+        // Spawn background deletion
+        tokio::spawn(async move {
+            let result = hub.events().delete("primary", &event_id).doit().await;
+
+            let msg = match result {
+                Ok(_) => "Deleted!".to_string(),
+                Err(e) => format!("Failed: {e}").to_string(),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn delete_selected_task(&mut self) {
+        let Some(task) = self.selected_task().cloned() else {
+            return;
+        };
+        let Some(task_id) = task.id else {
+            return;
+        };
+        let Some(hub) = self.task_hub.as_ref().cloned() else {
+            self.refreshing_status = ("Offline".to_string(), 2);
+            return;
+        };
+
+        let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
+        self.refreshing_status = ("Deleting task...".to_string(), 2);
+
+        tokio::spawn(async move {
+            let result = hub
+                .tasks()
+                .delete("your_tasklist_id", &task_id)
+                .doit()
+                .await;
+            let msg = match result {
+                Ok(_) => "Task deleted!".to_string(),
+                Err(e) => format!("Task delete failed: {e}").to_string(),
+            };
+            let _ = tx.send(msg);
+        });
     }
 
     async fn fetch_events(
@@ -401,6 +484,13 @@ impl App {
                     .current_date
                     .checked_sub_months(Months::new(1))
                     .unwrap()
+            }
+            KeyCode::Char('D') => {
+                if self.events_visible {
+                    self.delete_selected_event();
+                } else if self.tasks_visible {
+                    self.delete_selected_task();
+                }
             }
             KeyCode::Char('E') => self.toggle_event_visibility(),
             KeyCode::Char('T') => self.toggle_tasks_visibility(),
@@ -499,10 +589,12 @@ impl Widget for &App {
             .style(Modifier::BOLD)
             .render(title_area[1], buf);
 
-        if self.events_loading {
-            Paragraph::new(" ⟳")
-                .style(Modifier::BOLD)
-                .render(title_area[0], buf);
+        let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD);
+        match self.refreshing_status.clone().1 {
+            1 => status.green().render(title_area[0], buf),
+            2 => status.yellow().render(title_area[0], buf),
+            3 => status.red().render(title_area[0], buf),
+            _ => status.render(title_area[0], buf),
         }
 
         let status_text = match self.auth_status {
@@ -761,7 +853,7 @@ impl Widget for &App {
                 .split(main_area[1]);
 
             let tasks = self.tasks_cache.clone();
-            let items: Vec<Text> = {
+            let items: Vec<Span> = {
                 tasks
                     .iter()
                     .enumerate()
@@ -775,8 +867,8 @@ impl Widget for &App {
                             None => "".to_string(),
                         };
                         let mut item = match ev.completed {
-                            Some(_) => Text::raw(format!("{time}{title}")).dark_gray(),
-                            None => Text::raw(format!("{time}{title}")),
+                            Some(_) => Span::raw(format!("{time}{title}")).dark_gray(),
+                            None => Span::raw(format!("{time}{title}")),
                         };
                         if Some(i) == self.selected_task_index() {
                             item = item.bg(Color::DarkGray).fg(Color::White);
