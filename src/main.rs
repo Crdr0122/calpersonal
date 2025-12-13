@@ -43,7 +43,6 @@ struct App {
 
     deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
     deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
-    events_loading: bool,
     refreshing_status: (String, StatusColor),
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
@@ -84,7 +83,7 @@ impl App {
         let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
         let (tasks_tx, tasks_rx) = tokio::sync::oneshot::channel();
         let rt_handle = tokio::runtime::Handle::current();
-        let (deletion_feedback_tx, deletion_feedback_rx) = tokio::sync::mpsc::channel(8); // or 4, or even 1
+        let (deletion_feedback_tx, deletion_feedback_rx) = tokio::sync::mpsc::channel(1); // or 4, or even 1
         rt_handle.spawn(async move {
             let hub = calendar_auth::get_calendar_hub().await.ok();
             let _ = calendar_tx.send(hub);
@@ -108,7 +107,6 @@ impl App {
             tasks_cache,
             refreshing_status: ("".to_string(), StatusColor::White),
 
-            events_loading: false,
             deletion_feedback_tx: Some(deletion_feedback_tx),
             deletion_feedback_rx: Some(deletion_feedback_rx),
 
@@ -128,6 +126,7 @@ impl App {
         use std::time::Duration;
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
+
             if poll(Duration::from_millis(250))? {
                 match read()? {
                     Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
@@ -136,7 +135,9 @@ impl App {
                     _ => {}
                 }
             }
+
             self.check_updates();
+
             if self.needs_refresh {
                 self.start_background_refresh();
                 self.needs_refresh = false;
@@ -258,7 +259,6 @@ impl App {
         if let Some(hub) = self.event_hub.clone() {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.events_update_rx = Some(rx);
-            self.events_loading = true;
             self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
                 if let Some(new_events) = App::fetch_events(&hub).await {
@@ -272,7 +272,6 @@ impl App {
         if let Some(hub) = self.task_hub.clone() {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.tasks_update_rx = Some(rx);
-            self.events_loading = true;
             self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
                 if let Some(new_tasks) = App::fetch_tasks(&hub).await {
@@ -287,15 +286,22 @@ impl App {
         if let Some(rx) = &mut self.events_update_rx {
             if let Ok(new_cache) = rx.try_recv() {
                 self.events_cache = new_cache;
+                self.refreshing_status = ("".to_string(), StatusColor::White);
             }
         }
         if let Some(rx) = &mut self.tasks_update_rx {
             if let Ok(new_cache) = rx.try_recv() {
                 self.tasks_cache = new_cache;
+                self.refreshing_status = ("".to_string(), StatusColor::White);
             }
         }
-        self.events_loading = false;
-        self.refreshing_status = ("".to_string(), StatusColor::White);
+
+        if let Some(rx) = &mut self.deletion_feedback_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.refreshing_status = msg;
+                self.needs_refresh = true;
+            }
+        }
 
         if let Some(rx) = &mut self.calendar_hub_rx {
             if let Ok(hub) = rx.try_recv() {
@@ -316,19 +322,6 @@ impl App {
                 }
                 self.update_auth_status();
                 self.tasks_hub_rx = None;
-            }
-        }
-
-        if let Some(rx) = &mut self.deletion_feedback_rx {
-            while let Ok(msg) = rx.try_recv() {
-                self.refreshing_status = msg;
-                // Auto-clear after 2 seconds
-                let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
-                let clear_tx = tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let _ = clear_tx.send(("".to_string(), StatusColor::White));
-                });
             }
         }
     }
@@ -366,7 +359,7 @@ impl App {
                 Ok(_) => ("Deleted!".to_string(), StatusColor::White),
                 Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
-            let _ = tx.send(msg);
+            let _ = tx.send(msg).await;
         });
     }
 
@@ -394,7 +387,7 @@ impl App {
                     StatusColor::Red,
                 ),
             };
-            let _ = tx.send(msg);
+            let _ = tx.send(msg).await.ok();
         });
     }
 
@@ -589,7 +582,7 @@ impl Widget for &App {
         // Title area
         let title_area = Layout::new(
             Direction::Horizontal,
-            Constraint::from_percentages([8, 84, 8]),
+            Constraint::from_percentages([12, 76, 12]),
         )
         .split(main_chunks[0]);
 
@@ -598,7 +591,7 @@ impl Widget for &App {
             .style(Modifier::BOLD)
             .render(title_area[1], buf);
 
-        let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD);
+        let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD).centered();
         match self.refreshing_status.clone().1 {
             StatusColor::Green => status.green().render(title_area[0], buf),
             StatusColor::Yellow => status.yellow().render(title_area[0], buf),
@@ -612,7 +605,7 @@ impl Widget for &App {
             AuthStatus::Offline => "Offline".dim(),
         };
 
-        Paragraph::new(status_text).render(title_area[2], buf);
+        Paragraph::new(status_text.into_centered_line()).render(title_area[2], buf);
 
         // Calendar area
         let calendar_area = main_area[0];
