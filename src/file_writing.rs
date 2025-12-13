@@ -27,7 +27,7 @@ pub fn save_events_cache(cache: &HashMap<NaiveDate, Vec<api::Event>>) {
     }
 }
 
-pub fn load_tasks_cache() -> Vec<google_tasks1::api::Task> {
+pub fn load_tasks_cache() -> Vec<(google_tasks1::api::Task, String)> {
     let secret_path = home_dir()
         .expect("Could not find home directory")
         .join(TASKS_CACHE_FILE);
@@ -37,7 +37,7 @@ pub fn load_tasks_cache() -> Vec<google_tasks1::api::Task> {
     }
 }
 
-pub fn save_tasks_cache(cache: &[google_tasks1::api::Task]) {
+pub fn save_tasks_cache(cache: &[(google_tasks1::api::Task, String)]) {
     let secret_path = home_dir()
         .expect("Could not find home directory")
         .join(TASKS_CACHE_FILE);

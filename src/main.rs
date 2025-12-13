@@ -39,16 +39,15 @@ struct App {
     event_hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
     task_hub: Option<TasksHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    tasks_cache: Vec<google_tasks1::api::Task>,        // date → events that day
+    tasks_cache: Vec<(google_tasks1::api::Task, String)>, // date → events that day
 
-    deletion_status: Option<String>,
-    deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
+    deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
     events_loading: bool,
-    refreshing_status: (String, usize),
+    refreshing_status: (String, StatusColor),
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
-    tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<google_tasks1::api::Task>>>,
+    tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(google_tasks1::api::Task, String)>>>,
     needs_refresh: bool,
 
     auth_status: AuthStatus, // We'll define this enum
@@ -67,6 +66,14 @@ enum AuthStatus {
     Authenticating,
     Online,
     Offline, // Failed or no internet
+}
+
+#[derive(Clone)]
+enum StatusColor {
+    Green,
+    Yellow,
+    Red,
+    White,
 }
 
 impl App {
@@ -99,12 +106,11 @@ impl App {
             events_cache,
             task_hub: None,
             tasks_cache,
-            refreshing_status: ("".to_string(), 0),
+            refreshing_status: ("".to_string(), StatusColor::White),
 
             events_loading: false,
             deletion_feedback_tx: Some(deletion_feedback_tx),
             deletion_feedback_rx: Some(deletion_feedback_rx),
-            deletion_status: None,
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -238,7 +244,7 @@ impl App {
         self.current_day_events().get(idx)
     }
 
-    fn selected_task(&self) -> Option<&google_tasks1::api::Task> {
+    fn selected_task(&self) -> Option<&(google_tasks1::api::Task, String)> {
         let idx = self.selected_task_index()?;
         self.tasks_cache.get(idx)
     }
@@ -253,7 +259,7 @@ impl App {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.events_update_rx = Some(rx);
             self.events_loading = true;
-            self.refreshing_status = ("Refreshing".to_string(), 1);
+            self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
                 if let Some(new_events) = App::fetch_events(&hub).await {
                     file_writing::save_events_cache(&new_events);
@@ -267,7 +273,7 @@ impl App {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.tasks_update_rx = Some(rx);
             self.events_loading = true;
-            self.refreshing_status = ("Refreshing".to_string(), 1);
+            self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
                 if let Some(new_tasks) = App::fetch_tasks(&hub).await {
                     file_writing::save_tasks_cache(&new_tasks);
@@ -289,7 +295,7 @@ impl App {
             }
         }
         self.events_loading = false;
-        self.refreshing_status = ("".to_string(), 0);
+        self.refreshing_status = ("".to_string(), StatusColor::White);
 
         if let Some(rx) = &mut self.calendar_hub_rx {
             if let Ok(hub) = rx.try_recv() {
@@ -315,13 +321,13 @@ impl App {
 
         if let Some(rx) = &mut self.deletion_feedback_rx {
             while let Ok(msg) = rx.try_recv() {
-                self.refreshing_status = (msg, 1);
+                self.refreshing_status = msg;
                 // Auto-clear after 2 seconds
                 let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
                 let clear_tx = tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let _ = clear_tx.send("".to_string());
+                    let _ = clear_tx.send(("".to_string(), StatusColor::White));
                 });
             }
         }
@@ -345,20 +351,20 @@ impl App {
         };
 
         let Some(hub) = self.event_hub.as_ref().cloned() else {
-            self.refreshing_status = ("Offline".to_string(), 2);
+            self.refreshing_status = ("Offline".to_string(), StatusColor::White);
             return;
         };
 
         let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
-        self.refreshing_status = ("Deleting".to_string(), 1);
+        self.refreshing_status = ("Deleting".to_string(), StatusColor::Yellow);
 
         // Spawn background deletion
         tokio::spawn(async move {
             let result = hub.events().delete("primary", &event_id).doit().await;
 
             let msg = match result {
-                Ok(_) => "Deleted!".to_string(),
-                Err(e) => format!("Failed: {e}").to_string(),
+                Ok(_) => ("Deleted!".to_string(), StatusColor::White),
+                Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
             let _ = tx.send(msg);
         });
@@ -368,26 +374,25 @@ impl App {
         let Some(task) = self.selected_task().cloned() else {
             return;
         };
-        let Some(task_id) = task.id else {
+        let Some(task_id) = task.0.id else {
             return;
         };
         let Some(hub) = self.task_hub.as_ref().cloned() else {
-            self.refreshing_status = ("Offline".to_string(), 2);
+            self.refreshing_status = ("Offline".to_string(), StatusColor::White);
             return;
         };
 
         let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
-        self.refreshing_status = ("Deleting task...".to_string(), 2);
+        self.refreshing_status = ("Deleting task...".to_string(), StatusColor::Yellow);
 
         tokio::spawn(async move {
-            let result = hub
-                .tasks()
-                .delete("your_tasklist_id", &task_id)
-                .doit()
-                .await;
+            let result = hub.tasks().delete(&task.1, &task_id).doit().await;
             let msg = match result {
-                Ok(_) => "Task deleted!".to_string(),
-                Err(e) => format!("Task delete failed: {e}").to_string(),
+                Ok(_) => ("Task deleted!".to_string(), StatusColor::White),
+                Err(e) => (
+                    format!("Task delete failed: {e}").to_string(),
+                    StatusColor::Red,
+                ),
             };
             let _ = tx.send(msg);
         });
@@ -438,7 +443,7 @@ impl App {
 
     async fn fetch_tasks(
         hub: &TasksHub<HttpsConnector<connect::HttpConnector>>,
-    ) -> Option<Vec<google_tasks1::api::Task>> {
+    ) -> Option<Vec<(google_tasks1::api::Task, String)>> {
         let tasklists = match hub.tasklists().list().doit().await {
             Ok((_, tasks_list)) => tasks_list.items.unwrap_or_default(),
             Err(e) => {
@@ -448,14 +453,18 @@ impl App {
         };
         let mut all_tasks = Vec::new();
         for tasklist in tasklists {
-            if let Some(id) = tasklist.id {
-                match hub.tasks().list(&id).doit().await {
+            if let Some(tasklist_id) = tasklist.id {
+                match hub.tasks().list(&tasklist_id).doit().await {
                     Ok((_, tasks)) => {
                         if let Some(items) = tasks.items {
-                            all_tasks.extend(items);
+                            let tasks_with_list: Vec<(google_tasks1::api::Task, String)> = items
+                                .iter()
+                                .map(|t| (t.clone(), tasklist_id.clone()))
+                                .collect();
+                            all_tasks.extend(tasks_with_list);
                         }
                     }
-                    Err(e) => eprintln!("Failed to fetch tasks for list {id}: {e:?}"),
+                    Err(e) => eprintln!("Failed to fetch tasks for list {tasklist_id}: {e:?}"),
                 }
             }
         }
@@ -486,10 +495,10 @@ impl App {
                     .unwrap()
             }
             KeyCode::Char('D') => {
-                if self.events_visible {
-                    self.delete_selected_event();
-                } else if self.tasks_visible {
+                if self.tasks_visible {
                     self.delete_selected_task();
+                } else if self.events_visible {
+                    self.delete_selected_event();
                 }
             }
             KeyCode::Char('E') => self.toggle_event_visibility(),
@@ -591,9 +600,9 @@ impl Widget for &App {
 
         let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD);
         match self.refreshing_status.clone().1 {
-            1 => status.green().render(title_area[0], buf),
-            2 => status.yellow().render(title_area[0], buf),
-            3 => status.red().render(title_area[0], buf),
+            StatusColor::Green => status.green().render(title_area[0], buf),
+            StatusColor::Yellow => status.yellow().render(title_area[0], buf),
+            StatusColor::Red => status.red().render(title_area[0], buf),
             _ => status.render(title_area[0], buf),
         }
 
@@ -858,15 +867,15 @@ impl Widget for &App {
                     .iter()
                     .enumerate()
                     .map(|(i, ev)| {
-                        let title = ev.title.as_deref().unwrap_or("Untitled");
-                        let time = match ev.due.as_deref() {
+                        let title = ev.0.title.as_deref().unwrap_or("Untitled");
+                        let time = match ev.0.due.as_deref() {
                             Some(duedate) => match DateTime::parse_from_rfc3339(duedate) {
                                 Ok(e) => e.date_naive().format("%Y/%m/%d ").to_string(),
                                 Err(_) => "".to_string(),
                             },
                             None => "".to_string(),
                         };
-                        let mut item = match ev.completed {
+                        let mut item = match ev.0.completed {
                             Some(_) => Span::raw(format!("{time}{title}")).dark_gray(),
                             None => Span::raw(format!("{time}{title}")),
                         };
