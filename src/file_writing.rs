@@ -4,8 +4,8 @@ use google_calendar3::api;
 use std::collections::HashMap;
 use std::fs::{read_to_string, write};
 
-const EVENTS_CACHE_FILE: &str = "events_cache.json";
-const TASKS_CACHE_FILE: &str = "tasks_cache.json";
+const EVENTS_CACHE_FILE: &str = "/.cache/calpersonal/calendar_cache/events_cache.json";
+const TASKS_CACHE_FILE: &str = "/.cache/calpersonal/task_cache/tasks_cache.json";
 
 pub fn load_events_cache() -> HashMap<NaiveDate, Vec<api::Event>> {
     let secret_path = home_dir()

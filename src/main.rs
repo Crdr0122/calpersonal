@@ -207,14 +207,8 @@ impl App {
         if idx < events.len() {
             Some(idx)
         } else {
-            // Auto-clamp if cursor went too far (e.g. after deleting items)
             Some(events.len().saturating_sub(1))
         }
-    }
-
-    fn selected_event(&self) -> Option<&api::Event> {
-        let idx = self.selected_event_index()?;
-        self.current_day_events().get(idx)
     }
 
     fn selected_task_index(&self) -> Option<usize> {
@@ -228,6 +222,11 @@ impl App {
         } else {
             Some(self.tasks_cache.len().saturating_sub(1))
         }
+    }
+
+    fn selected_event(&self) -> Option<&api::Event> {
+        let idx = self.selected_event_index()?;
+        self.current_day_events().get(idx)
     }
 
     fn selected_task(&self) -> Option<&google_tasks1::api::Task> {
