@@ -3,10 +3,9 @@ mod file_writing;
 mod tasks_auth;
 use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate};
 use chrono_tz::Tz;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use google_calendar3::{CalendarHub, api};
 use google_tasks1::TasksHub;
-use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -17,13 +16,12 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
 };
 use rustls;
 use std::collections::HashMap;
 use std::io;
 use std::sync::LazyLock;
-use tui_textarea::TextArea;
 
 static APP_TIMEZONE: LazyLock<Tz> =
     LazyLock::new(|| "Asia/Tokyo".parse().expect("Invalid Timezone"));
@@ -37,16 +35,19 @@ struct App {
     exit: bool,
 
     // Calendar stuff
-    event_hub: Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
+    event_hub: Option<CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
-    task_hub: Option<TasksHub<HttpsConnector<connect::HttpConnector>>>, // The authenticated client
+    task_hub: Option<TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     tasks_cache: Vec<(google_tasks1::api::Task, String)>, // date → events that day
 
-    deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
-    deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
+    change_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
+    change_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
     refreshing_status: (String, StatusColor),
+    changing_status: (String, StatusColor),
 
     inputting: bool,
+    cursor_index: usize,
+    input_string: String,
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(google_tasks1::api::Task, String)>>>,
@@ -56,10 +57,14 @@ struct App {
 
     // Channels to receive hubs when auth completes
     calendar_hub_rx: Option<
-        tokio::sync::oneshot::Receiver<Option<CalendarHub<HttpsConnector<connect::HttpConnector>>>>,
+        tokio::sync::oneshot::Receiver<
+            Option<CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>,
+        >,
     >,
     tasks_hub_rx: Option<
-        tokio::sync::oneshot::Receiver<Option<TasksHub<HttpsConnector<connect::HttpConnector>>>>,
+        tokio::sync::oneshot::Receiver<
+            Option<TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>,
+        >,
     >,
 }
 
@@ -108,12 +113,15 @@ impl App {
             events_cache,
             task_hub: None,
             tasks_cache,
-            refreshing_status: ("".to_string(), StatusColor::White),
+            refreshing_status: (String::new(), StatusColor::White),
+            changing_status: (String::new(), StatusColor::White),
 
-            deletion_feedback_tx: Some(deletion_feedback_tx),
-            deletion_feedback_rx: Some(deletion_feedback_rx),
+            change_feedback_tx: Some(deletion_feedback_tx),
+            change_feedback_rx: Some(deletion_feedback_rx),
 
             inputting: false,
+            cursor_index: 0,
+            input_string: String::new(),
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -135,7 +143,11 @@ impl App {
             if poll(Duration::from_millis(250))? {
                 match read()? {
                     Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                        self.handle_key_event(key_event);
+                        if self.inputting {
+                            self.input_handle_key_event(key_event);
+                        } else {
+                            self.handle_key_event(key_event);
+                        }
                     }
                     _ => {}
                 }
@@ -151,8 +163,101 @@ impl App {
         Ok(())
     }
 
-    pub fn title(&self) -> String {
-        self.current_date.format("%Y %B").to_string()
+    fn input_handle_key_event(&mut self, key_event: KeyEvent) {
+        match (key_event.modifiers, key_event.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => self.cancel_input(),
+            (KeyModifiers::NONE, KeyCode::Char(ch)) => self.input_string.push(ch),
+            (KeyModifiers::SHIFT, KeyCode::Char(ch)) => self.input_string.push(ch),
+            (KeyModifiers::NONE, KeyCode::Enter) => self.create_task_or_event(),
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                if self.cursor_index > 0 {
+                    self.cursor_index = self.cursor_index - 1
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                if self.cursor_index < self.input_string.len() - 1 {
+                    self.cursor_index = self.cursor_index + 1
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.input_string.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_input(&mut self) {
+        self.input_string.clear();
+        self.cursor_index = 0;
+        self.inputting = false
+    }
+
+    fn create_task_or_event(&mut self) {
+        if self.input_string.trim().is_empty() {
+            self.cancel_input();
+            return;
+        }
+
+        let title = self.input_string.trim().to_string();
+        self.input_string.clear();
+
+        if self.tasks_visible {
+            self.create_task_in_background(title);
+        } else {
+            // self.create_event_in_background(title);
+        }
+
+        self.inputting = false;
+    }
+
+    fn create_task_in_background(&mut self, title: String) {
+        let Some(hub) = self.task_hub.as_ref().cloned() else {
+            self.changing_status = ("Offline — cannot create task".to_string(), StatusColor::Red);
+            return;
+        };
+
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone(); // Reuse channel or make separate
+        self.changing_status = ("Creating task".to_string(), StatusColor::Yellow);
+
+        self.cursor_line = 0;
+
+        tokio::spawn(async move {
+            let new_task = google_tasks1::api::Task {
+                title: Some(title),
+                ..google_tasks1::api::Task::default()
+            };
+
+            let tasklists = match hub.tasklists().list().doit().await {
+                Ok((_, tasks_list)) => tasks_list.items.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("Failed to fetch tasklists: {e:?}");
+                    Vec::new()
+                }
+            };
+
+            let msg = match tasklists.first() {
+                None => ("No Tasklist!".to_string(), StatusColor::Red),
+                Some(primary_tasklist) => {
+                    let result = hub
+                        .tasks()
+                        .insert(new_task, primary_tasklist.id.as_ref().unwrap()) // Use primary list
+                        .doit()
+                        .await;
+
+                    match result {
+                        Ok((_, _)) => {
+                            // You could update cache with real ID here if you track it
+                            ("Task created!".to_string(), StatusColor::Green)
+                        }
+                        Err(e) => (
+                            format!("Failed to create task: {e}").to_string(),
+                            StatusColor::Red,
+                        ),
+                    }
+                }
+            };
+            let _ = tx.send(msg).await;
+        });
     }
 
     fn first_day_of_month(&self) -> NaiveDate {
@@ -301,9 +406,9 @@ impl App {
             }
         }
 
-        if let Some(rx) = &mut self.deletion_feedback_rx {
+        if let Some(rx) = &mut self.change_feedback_rx {
             if let Ok(msg) = rx.try_recv() {
-                self.refreshing_status = msg;
+                self.changing_status = msg;
                 self.needs_refresh = true;
             }
         }
@@ -349,19 +454,19 @@ impl App {
         };
 
         let Some(hub) = self.event_hub.as_ref().cloned() else {
-            self.refreshing_status = ("Offline".to_string(), StatusColor::White);
+            self.changing_status = ("Offline".to_string(), StatusColor::White);
             return;
         };
 
-        let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
-        self.refreshing_status = ("Deleting".to_string(), StatusColor::Yellow);
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+        self.changing_status = ("Deleting".to_string(), StatusColor::Yellow);
 
         // Spawn background deletion
         tokio::spawn(async move {
             let result = hub.events().delete("primary", &event_id).doit().await;
 
             let msg = match result {
-                Ok(_) => ("Deleted!".to_string(), StatusColor::White),
+                Ok(_) => ("Event Deleted!".to_string(), StatusColor::Green),
                 Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
             let _ = tx.send(msg).await;
@@ -376,19 +481,19 @@ impl App {
             return;
         };
         let Some(hub) = self.task_hub.as_ref().cloned() else {
-            self.refreshing_status = ("Offline".to_string(), StatusColor::White);
+            self.changing_status = ("Offline".to_string(), StatusColor::White);
             return;
         };
 
-        let tx = self.deletion_feedback_tx.as_ref().unwrap().clone();
-        self.refreshing_status = ("Deleting task...".to_string(), StatusColor::Yellow);
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+        self.changing_status = ("Deleting task...".to_string(), StatusColor::Yellow);
 
         tokio::spawn(async move {
             let result = hub.tasks().delete(&task.1, &task_id).doit().await;
             let msg = match result {
-                Ok(_) => ("Task deleted!".to_string(), StatusColor::White),
+                Ok(_) => ("Task deleted!".to_string(), StatusColor::Green),
                 Err(e) => (
-                    format!("Task delete failed: {e}").to_string(),
+                    format!("Failed: {e}").to_string(),
                     StatusColor::Red,
                 ),
             };
@@ -397,7 +502,7 @@ impl App {
     }
 
     async fn fetch_events(
-        hub: &CalendarHub<HttpsConnector<connect::HttpConnector>>,
+        hub: &CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>,
     ) -> Option<HashMap<NaiveDate, Vec<api::Event>>> {
         match hub
             .events()
@@ -440,7 +545,7 @@ impl App {
     }
 
     async fn fetch_tasks(
-        hub: &TasksHub<HttpsConnector<connect::HttpConnector>>,
+        hub: &TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>,
     ) -> Option<Vec<(google_tasks1::api::Task, String)>> {
         let tasklists = match hub.tasklists().list().doit().await {
             Ok((_, tasks_list)) => tasks_list.items.unwrap_or_default(),
@@ -501,7 +606,9 @@ impl App {
             }
             KeyCode::Char('E') => self.toggle_event_visibility(),
             KeyCode::Char('T') => self.toggle_tasks_visibility(),
+            KeyCode::Char('t') => self.current_date = self.today,
             KeyCode::Char('R') => self.needs_refresh = true,
+            KeyCode::Char('o') => self.inputting = true,
             _ => {}
         }
     }
@@ -566,7 +673,11 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let main_chunks = Layout::new(
             Direction::Vertical,
-            Constraint::from_percentages([3, 94, 3]),
+            [
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ],
         )
         .split(area);
 
@@ -591,28 +702,39 @@ impl Widget for &App {
         )
         .split(main_chunks[0]);
 
-        Paragraph::new(self.title())
+        // Title
+        Paragraph::new(self.current_date.format("%Y %B").to_string())
             .centered()
             .style(Modifier::BOLD)
             .render(title_area[1], buf);
 
-        let status = Paragraph::new(self.refreshing_status.clone().0)
-            .style(Modifier::BOLD)
-            .centered();
+        // Refreshing status
+        let status_area = title_area[0].inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
+        let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD);
         match self.refreshing_status.clone().1 {
-            StatusColor::Green => status.green().render(title_area[0], buf),
-            StatusColor::Yellow => status.yellow().render(title_area[0], buf),
-            StatusColor::Red => status.red().render(title_area[0], buf),
-            _ => status.render(title_area[0], buf),
+            StatusColor::Green => status.green().render(status_area, buf),
+            StatusColor::Yellow => status.yellow().render(status_area, buf),
+            StatusColor::Red => status.red().render(status_area, buf),
+            _ => status.render(status_area, buf),
         }
 
-        let status_text = match self.auth_status {
+        // Online status
+        let auth_status = match self.auth_status {
             AuthStatus::Authenticating => "Authenticating".yellow(),
             AuthStatus::Online => "Online".green(),
             AuthStatus::Offline => "Offline".dim(),
         };
 
-        Paragraph::new(status_text.into_centered_line()).render(title_area[2], buf);
+        Paragraph::new(auth_status.into_right_aligned_line()).render(
+            title_area[2].inner(ratatui::layout::Margin {
+                vertical: 0,
+                horizontal: 1,
+            }),
+            buf,
+        );
 
         // Calendar area
         let calendar_area = main_area[0];
@@ -795,12 +917,6 @@ impl Widget for &App {
             }
         }
 
-        // Text input area
-
-        let mut textarea = TextArea::default();
-        textarea.set_cursor_line_style(Style::default());
-        textarea.render(main_chunks[2], buf);
-
         if self.events_visible {
             let event_area_horizontal = Layout::new(
                 Direction::Vertical,
@@ -903,6 +1019,43 @@ impl Widget for &App {
                     }),
                     buf,
                 );
+        }
+
+        let bottom_area = Layout::new(
+            Direction::Horizontal,
+            Constraint::from_percentages([50, 50]),
+        )
+        .split(main_chunks[2]);
+        // Changing status
+        let status = Paragraph::new(self.changing_status.clone().0)
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(Modifier::BOLD);
+        let status_area = bottom_area[1].inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
+
+        match self.changing_status.clone().1 {
+            StatusColor::Green => status.green().render(status_area, buf),
+            StatusColor::Yellow => status.yellow().render(status_area, buf),
+            StatusColor::Red => status.red().render(status_area, buf),
+            _ => status.render(status_area, buf),
+        }
+
+        // Text input area
+
+        if self.inputting {
+            // Clear::default().render(event_area[1], buf);
+            let input_box = Span::raw(self.input_string.clone());
+            Paragraph::new(input_box)
+                // .block(Block::bordered())
+                .render(
+                    bottom_area[0].inner(ratatui::layout::Margin {
+                        vertical: 0,
+                        horizontal: 1,
+                    }),
+                    buf,
+                )
         }
     }
 }
