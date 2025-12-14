@@ -1,11 +1,12 @@
 mod calendar_auth;
 mod file_writing;
+mod parse_input;
 mod tasks_auth;
-use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate};
+use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate, NaiveDateTime};
 use chrono_tz::Tz;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use google_calendar3::{CalendarHub, api};
-use google_tasks1::TasksHub;
+use google_tasks1::{TasksHub, api::Task};
 use hyper_util::client::legacy::connect;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -38,7 +39,7 @@ struct App {
     event_hub: Option<CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
     task_hub: Option<TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    tasks_cache: Vec<(google_tasks1::api::Task, String)>, // date → events that day
+    tasks_cache: Vec<(Task, String)>, // date → events that day
 
     change_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
     change_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
@@ -50,7 +51,7 @@ struct App {
     input_string: String,
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
-    tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(google_tasks1::api::Task, String)>>>,
+    tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(Task, String)>>>,
     needs_refresh: bool,
 
     auth_status: AuthStatus,
@@ -215,6 +216,7 @@ impl App {
     }
 
     fn create_task_or_event(&mut self) {
+        // Trimming and checking empty is already done here
         if self.input_string.trim().is_empty() {
             self.cancel_input();
             return;
@@ -233,6 +235,7 @@ impl App {
     }
 
     fn create_task_in_background(&mut self, title: String) {
+        // Trimming and checking empty is already done
         let Some(hub) = self.task_hub.as_ref().cloned() else {
             self.changing_status = ("Offline — cannot create task".to_string(), StatusColor::Red);
             return;
@@ -240,15 +243,22 @@ impl App {
 
         let tx = self.change_feedback_tx.as_ref().unwrap().clone(); // Reuse channel or make separate
         self.changing_status = ("Creating task".to_string(), StatusColor::Yellow);
-
         self.cursor_line = 0;
 
-        tokio::spawn(async move {
-            let new_task = google_tasks1::api::Task {
-                title: Some(title),
-                ..google_tasks1::api::Task::default()
-            };
+        let current_year = self.current_date.year();
+        let new_task = match parse_input::parse_date(&title, current_year) {
+            (t, None) => Task {
+                title: Some(t),
+                ..Task::default()
+            },
+            (t, Some(due)) => Task {
+                title: Some(t),
+                due: Some(due),
+                ..Task::default()
+            },
+        };
 
+        tokio::spawn(async move {
             let tasklists = match hub.tasklists().list().doit().await {
                 Ok((_, tasks_list)) => tasks_list.items.unwrap_or_default(),
                 Err(e) => {
@@ -280,6 +290,8 @@ impl App {
     }
 
     fn create_event_in_background(&mut self, title: String) {
+        // Trimming and checking empty is already done
+
         let Some(hub) = self.event_hub.as_ref().cloned() else {
             self.changing_status = (
                 "Offline — cannot create event".to_string(),
@@ -293,25 +305,54 @@ impl App {
 
         // Use current_date as the day
         let date = self.current_date;
+        let new_event = match parse_input::parse_time_range(&title.trim()) {
+            (title, Some(s), Some(e)) => {
+                let start_tz = NaiveDateTime::new(date, s)
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let start = api::EventDateTime {
+                    date: None,
+                    date_time: Some(start_tz),
+                    time_zone: None,
+                };
+                let end_tz = NaiveDateTime::new(date, e)
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let end = api::EventDateTime {
+                    date: None,
+                    date_time: Some(end_tz),
+                    time_zone: None,
+                };
 
-        // Simple: make it an all-day event
-        // Or: prompt for time? For now, all-day for simplicity
-        let start = api::EventDateTime {
-            date: Some(date),
-            date_time: None,
-            time_zone: None,
-        };
-        let end = api::EventDateTime {
-            date: Some(date + chrono::Days::new(1)),
-            date_time: None,
-            time_zone: None,
-        };
-
-        let new_event = api::Event {
-            summary: Some(title),
-            start: Some(start),
-            end: Some(end),
-            ..Default::default()
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+            (title, _, _) => {
+                let start = api::EventDateTime {
+                    date: Some(date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                let end = api::EventDateTime {
+                    date: Some(date + chrono::Days::new(1)),
+                    date_time: None,
+                    time_zone: None,
+                };
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
         };
 
         tokio::spawn(async move {
@@ -423,7 +464,7 @@ impl App {
         self.current_day_events().get(idx)
     }
 
-    fn selected_task(&self) -> Option<&(google_tasks1::api::Task, String)> {
+    fn selected_task(&self) -> Option<&(Task, String)> {
         let idx = self.selected_task_index()?;
         self.tasks_cache.get(idx)
     }
@@ -610,7 +651,7 @@ impl App {
 
     async fn fetch_tasks(
         hub: &TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>,
-    ) -> Option<Vec<(google_tasks1::api::Task, String)>> {
+    ) -> Option<Vec<(Task, String)>> {
         let tasklists = match hub.tasklists().list().doit().await {
             Ok((_, tasks_list)) => tasks_list.items.unwrap_or_default(),
             Err(e) => {
@@ -624,7 +665,7 @@ impl App {
                 match hub.tasks().list(&tasklist_id).doit().await {
                     Ok((_, tasks)) => {
                         if let Some(items) = tasks.items {
-                            let tasks_with_list: Vec<(google_tasks1::api::Task, String)> = items
+                            let tasks_with_list: Vec<(Task, String)> = items
                                 .iter()
                                 .map(|t| (t.clone(), tasklist_id.clone()))
                                 .collect();
