@@ -1,10 +1,28 @@
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 
-pub fn parse_time_range(input: &str) -> (String, Option<NaiveTime>, Option<NaiveTime>) {
+pub fn parse_time_range(
+    input: &str,
+    current_date: NaiveDate,
+) -> (
+    String,
+    Option<NaiveDateTime>,
+    Option<NaiveDateTime>,
+    NaiveDate,
+    NaiveDate,
+) {
     // Trimming and checking empty is already done
 
     let time_re = regex::Regex::new(r"^(\d{1,2}:\d{2})\s+-\s+(\d{1,2}:\d{2})\s").unwrap();
-    // let single_time_re = regex::Regex::new(r"^(\d{1,2}:\d{2})\s").unwrap();
+    let date_time_re =
+        regex::Regex::new(r"^(\d{1,2}/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+(\d{1,2}:\d{2})\s").unwrap();
+    let year_date_time_re =
+        regex::Regex::new(r"^(\d{4}/\d{1,2}/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+(\d{1,2}:\d{2})\s")
+            .unwrap();
+    let date_re = regex::Regex::new(r"^(\d{1,2}/\d{1,2})\s+-\s+(\d{1,2}/\d{1,2})\s").unwrap();
+    let year_date_re =
+        regex::Regex::new(r"^(\d{4}/\d{1,2}/\d{1,2})\s+-\s+(\d{4}/\d{1,2}/\d{1,2})\s").unwrap();
+    let only_date_re = regex::Regex::new(r"^(\d{1,2}/\d{1,2})\s").unwrap();
+    let only_year_date_re = regex::Regex::new(r"^(\d{4}/\d{1,2}/\d{1,2})\s").unwrap();
 
     if let Some(caps) = time_re.captures(input) {
         let start_str = caps.get(1).unwrap().as_str();
@@ -16,10 +34,103 @@ pub fn parse_time_range(input: &str) -> (String, Option<NaiveTime>, Option<Naive
         ) {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, Some(start), Some(end));
+            return (
+                summary,
+                Some(NaiveDateTime::new(current_date, start)),
+                Some(NaiveDateTime::new(current_date, end)),
+                current_date,
+                current_date,
+            );
+        }
+    } else if let Some(caps) = date_time_re.captures(input) {
+        let current_year = current_date.year().to_string();
+        let event_date = caps.get(1).unwrap().as_str().to_owned();
+        let start_str = caps.get(2).unwrap().as_str();
+        let end_str = caps.get(3).unwrap().as_str();
+
+        if let (Ok(start), Ok(end)) = (
+            NaiveDateTime::parse_from_str(
+                &(current_year.clone() + "/" + &event_date + ":" + start_str),
+                "%Y/%m/%d:%H:%M",
+            ),
+            NaiveDateTime::parse_from_str(
+                &(current_year + "/" + &event_date + ":" + end_str),
+                "%Y/%m/%d:%H:%M",
+            ),
+        ) {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, Some(start), Some(end), current_date, current_date);
+        }
+    } else if let Some(caps) = year_date_time_re.captures(input) {
+        let event_date = caps.get(1).unwrap().as_str().to_owned();
+        let start_str = caps.get(2).unwrap().as_str();
+        let end_str = caps.get(3).unwrap().as_str();
+
+        if let (Ok(start), Ok(end)) = (
+            NaiveDateTime::parse_from_str(
+                &(event_date.clone() + ":" + start_str),
+                "%Y/%-m/%-d:%H:%M",
+            ),
+            NaiveDateTime::parse_from_str(&(event_date + ":" + end_str), "%Y/%-m/%-d:%H:%M"),
+        ) {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, Some(start), Some(end), current_date, current_date);
+        }
+    } else if let Some(caps) = date_re.captures(input) {
+        let current_year = current_date.year().to_string();
+        let start_str = caps.get(1).unwrap().as_str();
+        let end_str = caps.get(2).unwrap().as_str();
+
+        if let (Ok(start), Ok(end)) = (
+            NaiveDate::parse_from_str(&(current_year.clone() + start_str), "%Y%-m/%-d"),
+            NaiveDate::parse_from_str(&(current_year + end_str), "%Y%-m/%-d"),
+        ) {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, None, None, start, end);
+        }
+    } else if let Some(caps) = year_date_re.captures(input) {
+        let start_str = caps.get(1).unwrap().as_str();
+        let end_str = caps.get(2).unwrap().as_str();
+
+        if let (Ok(start), Ok(end)) = (
+            NaiveDate::parse_from_str(&(start_str), "%Y/%-m/%-d"),
+            NaiveDate::parse_from_str(&(end_str), "%Y/%-m/%-d"),
+        ) {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, None, None, start, end);
+        }
+    } else if let Some(caps) = only_date_re.captures(input) {
+        let current_year = current_date.year().to_string();
+        let start_str = caps.get(1).unwrap().as_str();
+
+        if let Ok(start) =
+            NaiveDate::parse_from_str(&(current_year + "/" + start_str), "%Y/%-m/%-d")
+        {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, None, None, start, start.succ_opt().unwrap());
+        }
+    } else if let Some(caps) = only_year_date_re.captures(input) {
+        let start_str = caps.get(1).unwrap().as_str();
+
+        if let Ok(start) = NaiveDate::parse_from_str(&(start_str), "%Y/%-m/%-d") {
+            let summary_start = caps.get(0).unwrap().end();
+            let summary = input[summary_start..].trim().to_string();
+            return (summary, None, None, start, start.succ_opt().unwrap());
         }
     }
-    (input.to_string(), None, None)
+
+    (
+        input.to_string(),
+        None,
+        None,
+        current_date,
+        current_date.succ_opt().unwrap(),
+    )
 }
 
 pub fn parse_date(input: &str, current_year: i32) -> (String, Option<String>) {
