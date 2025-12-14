@@ -14,7 +14,7 @@ use ratatui::{
     layout::Rect,
     layout::{Constraint, Direction, Layout},
     prelude::Stylize,
-    style::{Color, Modifier},
+    style::{Color, Modifier, Style},
     symbols,
     text::{Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
@@ -23,6 +23,7 @@ use rustls;
 use std::collections::HashMap;
 use std::io;
 use std::sync::LazyLock;
+use tui_textarea::TextArea;
 
 static APP_TIMEZONE: LazyLock<Tz> =
     LazyLock::new(|| "Asia/Tokyo".parse().expect("Invalid Timezone"));
@@ -44,6 +45,8 @@ struct App {
     deletion_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
     deletion_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
     refreshing_status: (String, StatusColor),
+
+    inputting: bool,
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(google_tasks1::api::Task, String)>>>,
@@ -109,6 +112,8 @@ impl App {
 
             deletion_feedback_tx: Some(deletion_feedback_tx),
             deletion_feedback_rx: Some(deletion_feedback_rx),
+
+            inputting: false,
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -591,7 +596,9 @@ impl Widget for &App {
             .style(Modifier::BOLD)
             .render(title_area[1], buf);
 
-        let status = Paragraph::new(self.refreshing_status.clone().0).style(Modifier::BOLD).centered();
+        let status = Paragraph::new(self.refreshing_status.clone().0)
+            .style(Modifier::BOLD)
+            .centered();
         match self.refreshing_status.clone().1 {
             StatusColor::Green => status.green().render(title_area[0], buf),
             StatusColor::Yellow => status.yellow().render(title_area[0], buf),
@@ -787,6 +794,13 @@ impl Widget for &App {
                 }
             }
         }
+
+        // Text input area
+
+        let mut textarea = TextArea::default();
+        textarea.set_cursor_line_style(Style::default());
+        textarea.render(main_chunks[2], buf);
+
         if self.events_visible {
             let event_area_horizontal = Layout::new(
                 Direction::Vertical,
