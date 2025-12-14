@@ -7,8 +7,8 @@ pub fn parse_time_range(
     String,
     Option<NaiveDateTime>,
     Option<NaiveDateTime>,
-    NaiveDate,
-    NaiveDate,
+    Option<NaiveDate>,
+    Option<NaiveDate>,
 ) {
     // Trimming and checking empty is already done
 
@@ -38,8 +38,8 @@ pub fn parse_time_range(
                 summary,
                 Some(NaiveDateTime::new(current_date, start)),
                 Some(NaiveDateTime::new(current_date, end)),
-                current_date,
-                current_date,
+                None,
+                None,
             );
         }
     } else if let Some(caps) = date_time_re.captures(input) {
@@ -60,7 +60,7 @@ pub fn parse_time_range(
         ) {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, Some(start), Some(end), current_date, current_date);
+            return (summary, Some(start), Some(end), None, None);
         }
     } else if let Some(caps) = year_date_time_re.captures(input) {
         let event_date = caps.get(1).unwrap().as_str().to_owned();
@@ -76,7 +76,7 @@ pub fn parse_time_range(
         ) {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, Some(start), Some(end), current_date, current_date);
+            return (summary, Some(start), Some(end), None, None);
         }
     } else if let Some(caps) = date_re.captures(input) {
         let current_year = current_date.year().to_string();
@@ -89,7 +89,7 @@ pub fn parse_time_range(
         ) {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, None, None, start, end);
+            return (summary, None, None, Some(start), Some(end));
         }
     } else if let Some(caps) = year_date_re.captures(input) {
         let start_str = caps.get(1).unwrap().as_str();
@@ -101,7 +101,7 @@ pub fn parse_time_range(
         ) {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, None, None, start, end);
+            return (summary, None, None, Some(start), Some(end));
         }
     } else if let Some(caps) = only_date_re.captures(input) {
         let current_year = current_date.year().to_string();
@@ -112,7 +112,13 @@ pub fn parse_time_range(
         {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, None, None, start, start.succ_opt().unwrap());
+            return (
+                summary,
+                None,
+                None,
+                Some(start),
+                Some(start.succ_opt().unwrap()),
+            );
         }
     } else if let Some(caps) = only_year_date_re.captures(input) {
         let start_str = caps.get(1).unwrap().as_str();
@@ -120,17 +126,17 @@ pub fn parse_time_range(
         if let Ok(start) = NaiveDate::parse_from_str(&(start_str), "%Y/%-m/%-d") {
             let summary_start = caps.get(0).unwrap().end();
             let summary = input[summary_start..].trim().to_string();
-            return (summary, None, None, start, start.succ_opt().unwrap());
+            return (
+                summary,
+                None,
+                None,
+                Some(start),
+                Some(start.succ_opt().unwrap()),
+            );
         }
     }
 
-    (
-        input.to_string(),
-        None,
-        None,
-        current_date,
-        current_date.succ_opt().unwrap(),
-    )
+    (input.to_string(), None, None, None, None)
 }
 
 pub fn parse_date(input: &str, current_year: i32) -> (String, Option<String>) {

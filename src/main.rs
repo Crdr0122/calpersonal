@@ -285,8 +285,93 @@ impl App {
         if self.tasks_visible {
             self.update_task_in_background(title);
         } else {
-            // self.update_event_in_background(title);
+            self.update_event_in_background(title);
         }
+    }
+
+    fn update_event_in_background(&mut self, title: String) {
+        // Trimming and checking empty is already done
+        let Some(hub) = self.event_hub.as_ref().cloned() else {
+            self.changing_status = ("Offline".to_string(), StatusColor::Red);
+            return;
+        };
+
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+        self.changing_status = ("Creating event".to_string(), StatusColor::Yellow);
+
+        // Use current_date as the day
+        let date = self.current_date;
+        let current_event = self.selected_event().unwrap().clone();
+        let updated_event = match parse_input::parse_time_range(&title.trim(), date) {
+            (title, Some(start_datetime), Some(end_datetime), _, _) => {
+                let start_tz = start_datetime
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let start = api::EventDateTime {
+                    date: None,
+                    date_time: Some(start_tz),
+                    time_zone: None,
+                };
+                let end_tz = end_datetime
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let end = api::EventDateTime {
+                    date: None,
+                    date_time: Some(end_tz),
+                    time_zone: None,
+                };
+
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+            (title, _, _, Some(start_date), Some(end_date)) => {
+                let start = api::EventDateTime {
+                    date: Some(start_date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                let end = api::EventDateTime {
+                    date: Some(end_date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+            (title, _, _, _, _) => api::Event {
+                summary: Some(title),
+                ..Default::default()
+            },
+        };
+
+        tokio::spawn(async move {
+            let result = hub
+                .events()
+                .patch(updated_event, "primary", &current_event.id.unwrap())
+                .doit()
+                .await;
+
+            let msg = match result {
+                Ok((_, _)) => {
+                    // You could update cache with real ID here if you track it
+                    ("Event created!".to_string(), StatusColor::Green)
+                }
+                Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
+            };
+            let _ = tx.send(msg).await;
+        });
     }
 
     fn update_task_in_background(&mut self, title: String) {
@@ -302,7 +387,7 @@ impl App {
 
         let (updating_task, updating_tasklist_id) = self.selected_task().unwrap().clone();
         let current_year = self.current_date.year();
-        let new_task = match parse_input::parse_date(&title, current_year) {
+        let updated_task = match parse_input::parse_date(&title, current_year) {
             (t, None) => Task {
                 title: Some(t),
                 ..Task::default()
@@ -318,7 +403,11 @@ impl App {
             let msg = {
                 let result = hub
                     .tasks()
-                    .patch(new_task, &updating_tasklist_id, &updating_task.id.unwrap())
+                    .patch(
+                        updated_task,
+                        &updating_tasklist_id,
+                        &updating_task.id.unwrap(),
+                    )
                     .doit()
                     .await;
 
@@ -402,8 +491,8 @@ impl App {
         // Use current_date as the day
         let date = self.current_date;
         let new_event = match parse_input::parse_time_range(&title.trim(), date) {
-            (title, Some(s), Some(e), _, _) => {
-                let start_tz = s
+            (title, Some(start_datetime), Some(end_datetime), _, _) => {
+                let start_tz = start_datetime
                     .and_local_timezone(*APP_TIMEZONE)
                     .latest()
                     .unwrap()
@@ -413,7 +502,7 @@ impl App {
                     date_time: Some(start_tz),
                     time_zone: None,
                 };
-                let end_tz = e
+                let end_tz = end_datetime
                     .and_local_timezone(*APP_TIMEZONE)
                     .latest()
                     .unwrap()
@@ -431,7 +520,7 @@ impl App {
                     ..Default::default()
                 }
             }
-            (title, _, _, start_date, end_date) => {
+            (title, _, _, Some(start_date), Some(end_date)) => {
                 let start = api::EventDateTime {
                     date: Some(start_date),
                     date_time: None,
@@ -439,6 +528,24 @@ impl App {
                 };
                 let end = api::EventDateTime {
                     date: Some(end_date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+            (title, _, _, _, _) => {
+                let start = api::EventDateTime {
+                    date: Some(date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                let end = api::EventDateTime {
+                    date: Some(date.succ_opt().unwrap()),
                     date_time: None,
                     time_zone: None,
                 };
