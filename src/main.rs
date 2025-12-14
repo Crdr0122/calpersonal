@@ -13,10 +13,10 @@ use ratatui::{
     layout::Rect,
     layout::{Constraint, Direction, Layout},
     prelude::Stylize,
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     symbols,
     text::{Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use rustls;
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ struct App {
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(google_tasks1::api::Task, String)>>>,
     needs_refresh: bool,
 
-    auth_status: AuthStatus, // We'll define this enum
+    auth_status: AuthStatus,
 
     // Channels to receive hubs when auth completes
     calendar_hub_rx: Option<
@@ -91,7 +91,7 @@ impl App {
         let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
         let (tasks_tx, tasks_rx) = tokio::sync::oneshot::channel();
         let rt_handle = tokio::runtime::Handle::current();
-        let (deletion_feedback_tx, deletion_feedback_rx) = tokio::sync::mpsc::channel(1); // or 4, or even 1
+        let (deletion_feedback_tx, deletion_feedback_rx) = tokio::sync::mpsc::channel(1);
         rt_handle.spawn(async move {
             let hub = calendar_auth::get_calendar_hub().await.ok();
             let _ = calendar_tx.send(hub);
@@ -166,21 +166,43 @@ impl App {
     fn input_handle_key_event(&mut self, key_event: KeyEvent) {
         match (key_event.modifiers, key_event.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => self.cancel_input(),
-            (KeyModifiers::NONE, KeyCode::Char(ch)) => self.input_string.push(ch),
-            (KeyModifiers::SHIFT, KeyCode::Char(ch)) => self.input_string.push(ch),
+            (KeyModifiers::NONE, KeyCode::Char(ch)) | (KeyModifiers::SHIFT, KeyCode::Char(ch)) => {
+                self.input_string.insert(self.cursor_index, ch);
+                self.cursor_index += 1
+            }
             (KeyModifiers::NONE, KeyCode::Enter) => self.create_task_or_event(),
             (KeyModifiers::NONE, KeyCode::Left) => {
                 if self.cursor_index > 0 {
-                    self.cursor_index = self.cursor_index - 1
+                    self.cursor_index -= 1
                 }
             }
             (KeyModifiers::NONE, KeyCode::Right) => {
-                if self.cursor_index < self.input_string.len() - 1 {
-                    self.cursor_index = self.cursor_index + 1
+                if self.cursor_index < self.input_string.len() {
+                    self.cursor_index += 1
                 }
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
-                self.input_string.pop();
+                if self.cursor_index > 0 {
+                    self.input_string.remove(self.cursor_index - 1);
+                    self.cursor_index -= 1
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Delete) => {
+                if self.cursor_index < self.input_string.len() {
+                    self.input_string.remove(self.cursor_index);
+                }
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_index = 0,
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                self.cursor_index = self.input_string.len()
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                self.input_string.drain(..self.cursor_index);
+                self.cursor_index = 0
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                self.input_string.drain(self.cursor_index..);
+                self.cursor_index = self.input_string.len()
             }
             _ => {}
         }
@@ -200,14 +222,14 @@ impl App {
 
         let title = self.input_string.trim().to_string();
         self.input_string.clear();
+        self.cursor_index = 0;
+        self.inputting = false;
 
         if self.tasks_visible {
             self.create_task_in_background(title);
         } else {
-            // self.create_event_in_background(title);
+            self.create_event_in_background(title);
         }
-
-        self.inputting = false;
     }
 
     fn create_task_in_background(&mut self, title: String) {
@@ -249,12 +271,58 @@ impl App {
                             // You could update cache with real ID here if you track it
                             ("Task created!".to_string(), StatusColor::Green)
                         }
-                        Err(e) => (
-                            format!("Failed to create task: {e}").to_string(),
-                            StatusColor::Red,
-                        ),
+                        Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
                     }
                 }
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+
+    fn create_event_in_background(&mut self, title: String) {
+        let Some(hub) = self.event_hub.as_ref().cloned() else {
+            self.changing_status = (
+                "Offline — cannot create event".to_string(),
+                StatusColor::Red,
+            );
+            return;
+        };
+
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+        self.changing_status = ("Creating event".to_string(), StatusColor::Yellow);
+
+        // Use current_date as the day
+        let date = self.current_date;
+
+        // Simple: make it an all-day event
+        // Or: prompt for time? For now, all-day for simplicity
+        let start = api::EventDateTime {
+            date: Some(date),
+            date_time: None,
+            time_zone: None,
+        };
+        let end = api::EventDateTime {
+            date: Some(date + chrono::Days::new(1)),
+            date_time: None,
+            time_zone: None,
+        };
+
+        let new_event = api::Event {
+            summary: Some(title),
+            start: Some(start),
+            end: Some(end),
+            ..Default::default()
+        };
+
+        tokio::spawn(async move {
+            let result = hub.events().insert(new_event, "primary").doit().await;
+
+            let msg = match result {
+                Ok((_, _)) => {
+                    // You could update cache with real ID here if you track it
+                    ("Event created!".to_string(), StatusColor::Green)
+                }
+                Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
             let _ = tx.send(msg).await;
         });
@@ -492,10 +560,7 @@ impl App {
             let result = hub.tasks().delete(&task.1, &task_id).doit().await;
             let msg = match result {
                 Ok(_) => ("Task deleted!".to_string(), StatusColor::Green),
-                Err(e) => (
-                    format!("Failed: {e}").to_string(),
-                    StatusColor::Red,
-                ),
+                Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
             let _ = tx.send(msg).await.ok();
         });
@@ -509,7 +574,6 @@ impl App {
             .list("primary")
             .single_events(true)
             .order_by("startTime")
-            // Optional: Add time bounds for efficiency, e.g., .time_min(Local::now() - Months::new(1)), .time_max(Local::now() + Months::new(6))
             .doit()
             .await
         {
@@ -742,7 +806,7 @@ impl Widget for &App {
         let height = (calendar_area.height as usize) / (number_of_rows);
 
         let mut calendar_row_constraints = vec![Constraint::Length(height as u16); number_of_rows];
-        calendar_row_constraints.insert(0, Constraint::Length(calendar_area.height / 11));
+        calendar_row_constraints.insert(0, Constraint::Length(3));
         let calendar_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(calendar_row_constraints)
@@ -752,7 +816,7 @@ impl Widget for &App {
         let weekday_area = calendar_rows[0];
         let weekday_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 7); 7])
+            .constraints([Constraint::Fill(1); 7])
             .split(weekday_area);
 
         let left_bottom_border_cross = symbols::border::Set {
@@ -810,7 +874,7 @@ impl Widget for &App {
         for (row_index, row_chunk) in calendar_rows[1..(number_of_rows + 1)].iter().enumerate() {
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Ratio(1, 7); 7])
+                .constraints([Constraint::Fill(1); 7])
                 .split(*row_chunk);
 
             // Draw each cell in this row
@@ -981,9 +1045,6 @@ impl Widget for &App {
         }
 
         if self.tasks_visible {
-            let task_area = Layout::new(Direction::Vertical, Constraint::from_percentages([95, 5]))
-                .split(main_area[1]);
-
             let tasks = self.tasks_cache.clone();
             let items: Vec<Span> = {
                 tasks
@@ -1013,7 +1074,7 @@ impl Widget for &App {
             ratatui::widgets::List::new(items)
                 .block(Block::bordered().title("Tasks".bold().into_centered_line()))
                 .render(
-                    task_area[0].inner(ratatui::layout::Margin {
+                    main_area[1].inner(ratatui::layout::Margin {
                         vertical: 1,
                         horizontal: 5,
                     }),
@@ -1021,16 +1082,23 @@ impl Widget for &App {
                 );
         }
 
+        // Bottom Area
+
         let bottom_area = Layout::new(
             Direction::Horizontal,
-            Constraint::from_percentages([50, 50]),
+            [
+                Constraint::Length(8),
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+            ],
         )
         .split(main_chunks[2]);
+
         // Changing status
         let status = Paragraph::new(self.changing_status.clone().0)
             .alignment(ratatui::layout::Alignment::Right)
             .style(Modifier::BOLD);
-        let status_area = bottom_area[1].inner(ratatui::layout::Margin {
+        let status_area = bottom_area[2].inner(ratatui::layout::Margin {
             vertical: 0,
             horizontal: 1,
         });
@@ -1045,17 +1113,18 @@ impl Widget for &App {
         // Text input area
 
         if self.inputting {
-            // Clear::default().render(event_area[1], buf);
-            let input_box = Span::raw(self.input_string.clone());
-            Paragraph::new(input_box)
-                // .block(Block::bordered())
-                .render(
-                    bottom_area[0].inner(ratatui::layout::Margin {
-                        vertical: 0,
-                        horizontal: 1,
-                    }),
-                    buf,
-                )
+            if self.tasks_visible {
+                Paragraph::new(" Tasks: ").render(bottom_area[0], buf)
+            } else {
+                Paragraph::new(" Event: ").render(bottom_area[0], buf)
+            }
+            let cursor_char = "█";
+
+            let left = &self.input_string[..self.cursor_index];
+            let right = &self.input_string[self.cursor_index..];
+
+            let input_box = Span::raw(format!("{}{}{}", left, cursor_char, right));
+            Paragraph::new(input_box).render(bottom_area[1], buf)
         }
     }
 }
