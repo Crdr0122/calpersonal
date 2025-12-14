@@ -48,7 +48,8 @@ struct App {
 
     inputting: bool,
     cursor_index: usize,
-    input_string: String,
+    input_buffer: String,
+    updating_event_or_task: bool,
 
     events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(Task, String)>>>,
@@ -122,7 +123,8 @@ impl App {
 
             inputting: false,
             cursor_index: 0,
-            input_string: String::new(),
+            input_buffer: String::new(),
+            updating_event_or_task: false,
 
             events_update_rx: None,
             tasks_update_rx: None,
@@ -168,62 +170,96 @@ impl App {
         match (key_event.modifiers, key_event.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => self.cancel_input(),
             (KeyModifiers::NONE, KeyCode::Char(ch)) | (KeyModifiers::SHIFT, KeyCode::Char(ch)) => {
-                self.input_string.insert(self.cursor_index, ch);
-                self.cursor_index += 1
+                self.insert_char_at(ch, self.cursor_index);
+                self.cursor_index += 1;
             }
-            (KeyModifiers::NONE, KeyCode::Enter) => self.create_task_or_event(),
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if self.updating_event_or_task {
+                    self.updating_event_or_task = false;
+                    self.update_task_or_event()
+                } else {
+                    self.create_task_or_event()
+                }
+            }
             (KeyModifiers::NONE, KeyCode::Left) => {
                 if self.cursor_index > 0 {
                     self.cursor_index -= 1
                 }
             }
             (KeyModifiers::NONE, KeyCode::Right) => {
-                if self.cursor_index < self.input_string.len() {
+                if self.cursor_index < self.input_buffer.len() {
                     self.cursor_index += 1
                 }
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
                 if self.cursor_index > 0 {
-                    self.input_string.remove(self.cursor_index - 1);
+                    self.remove_char_at(self.cursor_index - 1);
                     self.cursor_index -= 1
                 }
             }
             (KeyModifiers::NONE, KeyCode::Delete) => {
-                if self.cursor_index < self.input_string.len() {
-                    self.input_string.remove(self.cursor_index);
+                if self.cursor_index < self.input_buffer.len() {
+                    self.remove_char_at(self.cursor_index);
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_index = 0,
-            (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-                self.cursor_index = self.input_string.len()
-            }
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.cursor_index = self.char_count(),
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                self.input_string.drain(..self.cursor_index);
+                let byte_pos = self.byte_offset_at_char(self.cursor_index);
+                self.input_buffer.drain(..byte_pos);
                 self.cursor_index = 0
             }
             (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
-                self.input_string.drain(self.cursor_index..);
-                self.cursor_index = self.input_string.len()
+                let byte_pos = self.byte_offset_at_char(self.cursor_index);
+                self.input_buffer.drain(byte_pos..);
+                self.cursor_index = self.char_count()
             }
             _ => {}
         }
     }
 
+    fn char_count(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
+    fn byte_offset_at_char(&self, char_idx: usize) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input_buffer.len())
+    }
+
+    fn remove_char_at(&mut self, char_idx: usize) {
+        if char_idx >= self.char_count() {
+            return;
+        }
+        let byte_pos = self.byte_offset_at_char(char_idx);
+        let char_len = self.input_buffer.chars().nth(char_idx).unwrap().len_utf8();
+        self.input_buffer.drain(byte_pos..byte_pos + char_len);
+    }
+
+    fn insert_char_at(&mut self, ch: char, char_idx: usize) {
+        let byte_pos = self.byte_offset_at_char(char_idx);
+        self.input_buffer.insert(byte_pos, ch);
+    }
+
     fn cancel_input(&mut self) {
-        self.input_string.clear();
+        self.input_buffer.clear();
+        self.updating_event_or_task = false;
         self.cursor_index = 0;
         self.inputting = false
     }
 
     fn create_task_or_event(&mut self) {
         // Trimming and checking empty is already done here
-        if self.input_string.trim().is_empty() {
+        if self.input_buffer.trim().is_empty() {
             self.cancel_input();
             return;
         }
 
-        let title = self.input_string.trim().to_string();
-        self.input_string.clear();
+        let title = self.input_buffer.trim().to_string();
+        self.input_buffer.clear();
         self.cursor_index = 0;
         self.inputting = false;
 
@@ -234,10 +270,149 @@ impl App {
         }
     }
 
+    fn update_task_or_event(&mut self) {
+        // Trimming and checking empty is already done here
+        if self.input_buffer.trim().is_empty() {
+            self.cancel_input();
+            return;
+        }
+
+        let title = self.input_buffer.trim().to_string();
+        self.input_buffer.clear();
+        self.cursor_index = 0;
+        self.inputting = false;
+
+        if self.tasks_visible {
+            self.update_task_in_background(title);
+        } else {
+            self.update_event_in_background(title);
+        }
+    }
+
+    fn update_task_in_background(&mut self, title: String) {
+        // Trimming and checking empty is already done
+        let Some(hub) = self.task_hub.as_ref().cloned() else {
+            self.changing_status = ("Offline".to_string(), StatusColor::Red);
+            return;
+        };
+
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone(); // Reuse channel or make separate
+        self.changing_status = ("Updating task".to_string(), StatusColor::Yellow);
+        self.cursor_line = 0;
+
+        let (updating_task, updating_tasklist_id) = self.selected_task().unwrap().clone();
+        let current_year = self.current_date.year();
+        let new_task = match parse_input::parse_date(&title, current_year) {
+            (t, None) => Task {
+                title: Some(t),
+                ..Task::default()
+            },
+            (t, Some(due)) => Task {
+                title: Some(t),
+                due: Some(due),
+                ..Task::default()
+            },
+        };
+
+        tokio::spawn(async move {
+            let msg = {
+                let result = hub
+                    .tasks()
+                    .patch(new_task, &updating_tasklist_id, &updating_task.id.unwrap())
+                    .doit()
+                    .await;
+
+                match result {
+                    Ok((_, _)) => {
+                        // You could update cache with real ID here if you track it
+                        ("Task updated!".to_string(), StatusColor::Green)
+                    }
+                    Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
+                }
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+
+    fn update_event_in_background(&mut self, title: String) {
+        // Trimming and checking empty is already done
+        let Some(hub) = self.event_hub.as_ref().cloned() else {
+            self.changing_status = ("Offline".to_string(), StatusColor::Red);
+            return;
+        };
+
+        let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+        self.changing_status = ("Updating event".to_string(), StatusColor::Yellow);
+
+        // Use current_date as the day
+        let date = self.current_date;
+        let new_event = match parse_input::parse_time_range(&title.trim()) {
+            (title, Some(s), Some(e)) => {
+                let start_tz = NaiveDateTime::new(date, s)
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let start = api::EventDateTime {
+                    date: None,
+                    date_time: Some(start_tz),
+                    time_zone: None,
+                };
+                let end_tz = NaiveDateTime::new(date, e)
+                    .and_local_timezone(*APP_TIMEZONE)
+                    .latest()
+                    .unwrap()
+                    .to_utc();
+                let end = api::EventDateTime {
+                    date: None,
+                    date_time: Some(end_tz),
+                    time_zone: None,
+                };
+
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+            (title, _, _) => {
+                let start = api::EventDateTime {
+                    date: Some(date),
+                    date_time: None,
+                    time_zone: None,
+                };
+                let end = api::EventDateTime {
+                    date: Some(date + chrono::Days::new(1)),
+                    date_time: None,
+                    time_zone: None,
+                };
+                api::Event {
+                    summary: Some(title),
+                    start: Some(start),
+                    end: Some(end),
+                    ..Default::default()
+                }
+            }
+        };
+
+        tokio::spawn(async move {
+            let result = hub.events().insert(new_event, "primary").doit().await;
+
+            let msg = match result {
+                Ok((_, _)) => {
+                    // You could update cache with real ID here if you track it
+                    ("Event created!".to_string(), StatusColor::Green)
+                }
+                Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
     fn create_task_in_background(&mut self, title: String) {
         // Trimming and checking empty is already done
         let Some(hub) = self.task_hub.as_ref().cloned() else {
-            self.changing_status = ("Offline — cannot create task".to_string(), StatusColor::Red);
+            self.changing_status = ("Offline".to_string(), StatusColor::Red);
             return;
         };
 
@@ -291,12 +466,8 @@ impl App {
 
     fn create_event_in_background(&mut self, title: String) {
         // Trimming and checking empty is already done
-
         let Some(hub) = self.event_hub.as_ref().cloned() else {
-            self.changing_status = (
-                "Offline — cannot create event".to_string(),
-                StatusColor::Red,
-            );
+            self.changing_status = ("Offline".to_string(), StatusColor::Red);
             return;
         };
 
@@ -682,6 +853,7 @@ impl App {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Char('q') => self.exit(),
+            KeyCode::Esc => self.exit(),
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
             KeyCode::Up => self.move_up(),
@@ -714,7 +886,38 @@ impl App {
             KeyCode::Char('t') => self.current_date = self.today,
             KeyCode::Char('R') => self.needs_refresh = true,
             KeyCode::Char('o') => self.inputting = true,
+            KeyCode::Char('a') => self.add_or_update_event(),
             _ => {}
+        }
+    }
+
+    fn add_or_update_event(&mut self) {
+        if self.tasks_visible {
+            self.updating_event_or_task = true;
+            self.input_buffer = self
+                .selected_task()
+                .unwrap()
+                .0
+                .title
+                .as_ref()
+                .unwrap()
+                .to_string();
+            self.cursor_index = self.char_count();
+            self.inputting = true
+        } else if self.events_visible {
+            self.updating_event_or_task = true;
+            self.input_buffer = self
+                .selected_event()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .to_string();
+            self.cursor_index = self.char_count();
+            self.inputting = true
+        } else {
+            self.updating_event_or_task = false;
+            self.inputting = true
         }
     }
 
@@ -1161,8 +1364,8 @@ impl Widget for &App {
             }
             let cursor_char = "█";
 
-            let left = &self.input_string[..self.cursor_index];
-            let right = &self.input_string[self.cursor_index..];
+            let left: String = self.input_buffer.chars().take(self.cursor_index).collect();
+            let right: String = self.input_buffer.chars().skip(self.cursor_index).collect();
 
             let input_box = Span::raw(format!("{}{}{}", left, cursor_char, right));
             Paragraph::new(input_box).render(bottom_area[1], buf)
