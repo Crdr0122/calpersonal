@@ -906,6 +906,18 @@ impl App {
                     .checked_sub_months(Months::new(1))
                     .unwrap()
             }
+            KeyCode::Char('y') => {
+                self.current_date = self
+                    .current_date
+                    .checked_add_months(Months::new(12))
+                    .unwrap()
+            }
+            KeyCode::Char('Y') => {
+                self.current_date = self
+                    .current_date
+                    .checked_sub_months(Months::new(12))
+                    .unwrap()
+            }
             KeyCode::Char('D') => {
                 if self.tasks_visible {
                     self.delete_selected_task();
