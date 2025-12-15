@@ -2,8 +2,7 @@ mod calendar_auth;
 mod file_writing;
 mod parse_input;
 mod tasks_auth;
-use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate};
-use chrono_tz::Tz;
+use chrono::{DateTime, Datelike, Days, FixedOffset, Local, Months, NaiveDate};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use google_calendar3::{CalendarHub, api};
 use google_tasks1::{TasksHub, api::Task};
@@ -22,17 +21,14 @@ use ratatui::{
 use rustls;
 use std::collections::HashMap;
 use std::io;
-use std::sync::LazyLock;
 
-static APP_TIMEZONE: LazyLock<Tz> =
-    LazyLock::new(|| "Asia/Tokyo".parse().expect("Invalid Timezone"));
-// Struct to hold our application state
 struct App {
     tasks_visible: bool,
     events_visible: bool,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     cursor_line: usize,
+    app_tz: FixedOffset,
     exit: bool,
 
     // Calendar stuff
@@ -88,6 +84,7 @@ enum StatusColor {
 impl App {
     async fn new() -> App {
         let today = Local::now().date_naive();
+        let app_tz = Local::now().offset().clone();
         let events_cache = file_writing::load_events_cache();
         let tasks_cache = file_writing::load_tasks_cache();
         let (calendar_tx, calendar_rx) = tokio::sync::oneshot::channel();
@@ -109,6 +106,7 @@ impl App {
             tasks_visible: false,
             events_visible: false,
             cursor_line: 0,
+            app_tz,
             exit: false,
 
             event_hub: None,
@@ -181,23 +179,24 @@ impl App {
                     self.create_task_or_event()
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Left) => {
+            (KeyModifiers::NONE, KeyCode::Left) | (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
                 if self.cursor_index > 0 {
                     self.cursor_index -= 1
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Right) => {
+            (KeyModifiers::NONE, KeyCode::Right) | (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
                 if self.cursor_index < self.input_buffer.len() {
                     self.cursor_index += 1
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Backspace) => {
+            (KeyModifiers::NONE, KeyCode::Backspace)
+            | (KeyModifiers::CONTROL, KeyCode::Char('h')) => {
                 if self.cursor_index > 0 {
                     self.remove_char_at(self.cursor_index - 1);
                     self.cursor_index -= 1
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Delete) => {
+            (KeyModifiers::NONE, KeyCode::Delete) | (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 if self.cursor_index < self.input_buffer.len() {
                     self.remove_char_at(self.cursor_index);
                 }
@@ -305,7 +304,7 @@ impl App {
         let updated_event = match parse_input::parse_time_range(&title.trim(), date) {
             (title, Some(start_datetime), Some(end_datetime), _, _) => {
                 let start_tz = start_datetime
-                    .and_local_timezone(*APP_TIMEZONE)
+                    .and_local_timezone(self.app_tz)
                     .latest()
                     .unwrap()
                     .to_utc();
@@ -315,7 +314,7 @@ impl App {
                     time_zone: None,
                 };
                 let end_tz = end_datetime
-                    .and_local_timezone(*APP_TIMEZONE)
+                    .and_local_timezone(self.app_tz)
                     .latest()
                     .unwrap()
                     .to_utc();
@@ -493,7 +492,7 @@ impl App {
         let new_event = match parse_input::parse_time_range(&title.trim(), date) {
             (title, Some(start_datetime), Some(end_datetime), _, _) => {
                 let start_tz = start_datetime
-                    .and_local_timezone(*APP_TIMEZONE)
+                    .and_local_timezone(self.app_tz)
                     .latest()
                     .unwrap()
                     .to_utc();
@@ -503,7 +502,7 @@ impl App {
                     time_zone: None,
                 };
                 let end_tz = end_datetime
-                    .and_local_timezone(*APP_TIMEZONE)
+                    .and_local_timezone(self.app_tz)
                     .latest()
                     .unwrap()
                     .to_utc();
@@ -682,8 +681,9 @@ impl App {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.events_update_rx = Some(rx);
             self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
+            let offset = self.app_tz.clone();
             tokio::spawn(async move {
-                if let Some(new_events) = App::fetch_events(&hub).await {
+                if let Some(new_events) = App::fetch_events(offset, &hub).await {
                     file_writing::save_events_cache(&new_events);
                     let _ = tx.send(new_events).await;
                 }
@@ -811,6 +811,7 @@ impl App {
     }
 
     async fn fetch_events(
+        app_tz: FixedOffset,
         hub: &CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>,
     ) -> Option<HashMap<NaiveDate, Vec<api::Event>>> {
         match hub
@@ -828,7 +829,7 @@ impl App {
                         let start_date_and_event = if let Some(start) = &event.start {
                             if let Some(date_time_str) = start.date_time {
                                 // Convert to your local timezone and get the local date + time
-                                let local_dt = date_time_str.with_timezone(&*APP_TIMEZONE);
+                                let local_dt = date_time_str.with_timezone(&app_tz);
                                 Some(local_dt.date_naive())
                             } else if let Some(date_str) = start.date {
                                 Some(date_str)
@@ -1194,9 +1195,7 @@ impl Widget for &App {
                                 .as_ref()
                                 .and_then(|s| s.date_time)
                                 .map(|dt| {
-                                    dt.with_timezone(&*APP_TIMEZONE)
-                                        .format("%H:%M ")
-                                        .to_string()
+                                    dt.with_timezone(&self.app_tz).format("%H:%M ").to_string()
                                 })
                                 .unwrap_or("".to_string());
                             let e = if current_cell.1 {
@@ -1300,18 +1299,14 @@ impl Widget for &App {
                             .start
                             .as_ref()
                             .and_then(|s| s.date_time)
-                            .map(|dt| {
-                                dt.with_timezone(&*APP_TIMEZONE)
-                                    .format(" %H:%M ")
-                                    .to_string()
-                            })
+                            .map(|dt| dt.with_timezone(&self.app_tz).format(" %H:%M ").to_string())
                             .unwrap_or(" ".to_string());
                         let end_time = ev
                             .end
                             .as_ref()
                             .and_then(|s| s.date_time)
                             .map(|dt| {
-                                dt.with_timezone(&*APP_TIMEZONE)
+                                dt.with_timezone(&self.app_tz)
                                     .format("- %H:%M ")
                                     .to_string()
                             })
