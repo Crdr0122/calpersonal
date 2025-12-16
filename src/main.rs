@@ -281,7 +281,6 @@ impl App {
 
         let title = self.input_buffer.trim().to_string();
         self.input_buffer.clear();
-        self.cursor_index = 0;
         self.inputting = false;
 
         if let AppLayout::Tasks(_) = self.app_layout {
@@ -289,6 +288,8 @@ impl App {
         } else {
             self.update_event_in_background(title);
         }
+        // Change cursor index in the end
+        self.cursor_index = 0;
     }
 
     fn update_event_in_background(&mut self, title: String) {
@@ -385,7 +386,6 @@ impl App {
 
         let tx = self.change_feedback_tx.as_ref().unwrap().clone(); // Reuse channel or make separate
         self.changing_status = ("Updating task".to_string(), StatusColor::Yellow);
-        self.cursor_line = 0;
 
         let (updating_task, updating_tasklist_id) = self.selected_task().unwrap().clone();
         let current_year = self.current_date.year();
@@ -867,6 +867,7 @@ impl App {
                     Ok((_, tasks)) => {
                         if let Some(items) = tasks.items {
                             let tasks_with_list: Vec<(Task, String)> = items
+                                
                                 .iter()
                                 .map(|t| (t.clone(), tasklist_id.clone()))
                                 .collect();
@@ -1401,6 +1402,41 @@ impl Widget for &App {
                         }),
                         buf,
                     );
+
+                if notes_visible {
+                    let task_area_horizontal = Layout::new(
+                        Direction::Vertical,
+                        Constraint::from_percentages([16, 68, 16]),
+                    )
+                    .split(main_area[0]);
+                    let task_area = Layout::new(
+                        Direction::Horizontal,
+                        Constraint::from_percentages([20, 60, 20]),
+                    )
+                    .split(task_area_horizontal[1]);
+                    Clear::default().render(task_area[1], buf);
+
+                    let task_notes = self
+                        .selected_task()
+                        .unwrap()
+                        .0
+                        .notes
+                        .clone()
+                        .unwrap_or("".to_string());
+
+                    let task_title = self
+                        .selected_task()
+                        .unwrap()
+                        .0
+                        .title
+                        .clone()
+                        .unwrap_or("".to_string());
+
+                    Paragraph::new(task_notes)
+                        .wrap(ratatui::widgets::Wrap { trim: true })
+                        .block(Block::bordered().title(task_title))
+                        .render(task_area[1], buf);
+                };
             }
             _ => {}
         }
