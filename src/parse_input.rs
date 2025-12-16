@@ -139,32 +139,52 @@ pub fn parse_time_range(
     (input.to_string(), None, None, None, None)
 }
 
-pub fn parse_date(input: &str, current_year: i32) -> (String, Option<String>) {
+pub fn parse_date_and_note(
+    input: &str,
+    current_year: i32,
+) -> (String, Option<String>, Option<String>) {
     let mm_dd_re = regex::Regex::new(r"^(\d{1,2}/\d{1,2})\s").unwrap();
     let yyyy_mm_dd_re = regex::Regex::new(r"^(\d{4}/\d{1,2}/\d{1,2})\s").unwrap();
     // 2026-01-20T00:00:00.000Z
-    if let Some(caps) = mm_dd_re.captures(input) {
+    let (title_without_date, due_date) = if let Some(caps) = mm_dd_re.captures(input) {
         let due_str = caps.get(1).unwrap().as_str();
         if let Ok(due) =
             NaiveDate::parse_from_str(&(current_year.to_string() + due_str), "%Y%-m/%-d")
         {
             let title_start = caps.get(0).unwrap().end();
             let title = input[title_start..].trim().to_string();
-            return (
+            (
                 title,
                 Some(due.format("%Y-%m-%dT00:00:00.000Z").to_string()),
-            );
+            )
+        } else {
+            (input.to_string(), None)
         }
     } else if let Some(caps) = yyyy_mm_dd_re.captures(input) {
         let due_str = caps.get(1).unwrap().as_str();
         if let Ok(due) = NaiveDate::parse_from_str(due_str, "%Y/%-m/%-d") {
             let title_start = caps.get(0).unwrap().end();
             let title = input[title_start..].trim().to_string();
-            return (
+            (
                 title,
                 Some(due.format("%Y-%m-%dT00:00:00.000Z").to_string()),
-            );
+            )
+        } else {
+            (input.to_string(), None)
         }
-    }
-    (input.to_string(), None)
+    } else {
+        (input.to_string(), None)
+    };
+
+    let notes_re = regex::Regex::new(r"\snotes:\s(.+)$").unwrap();
+    let (rem, notes) = if let Some(caps) = notes_re.captures(&title_without_date) {
+        let notes_str = caps.get(1).unwrap().as_str();
+        let title_end = caps.get(0).unwrap().start();
+        let title = title_without_date[..title_end].trim().to_string();
+        (title, Some(notes_str.to_string()))
+    } else {
+        (title_without_date, None)
+    };
+
+    (rem, due_date, notes)
 }

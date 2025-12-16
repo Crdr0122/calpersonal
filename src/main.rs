@@ -23,8 +23,7 @@ use std::collections::HashMap;
 use std::io;
 
 struct App {
-    tasks_visible: bool,
-    events_visible: bool,
+    app_layout: AppLayout,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     cursor_line: usize,
@@ -80,6 +79,11 @@ enum StatusColor {
     Red,
     White,
 }
+enum AppLayout {
+    Calendar,
+    Events,
+    Tasks(bool),
+}
 
 impl App {
     async fn new() -> App {
@@ -103,8 +107,7 @@ impl App {
         let app = Self {
             current_date: today,
             today: today,
-            tasks_visible: false,
-            events_visible: false,
+            app_layout: AppLayout::Calendar,
             cursor_line: 0,
             app_tz,
             exit: false,
@@ -262,7 +265,7 @@ impl App {
         self.cursor_index = 0;
         self.inputting = false;
 
-        if self.tasks_visible {
+        if let AppLayout::Tasks(_) = self.app_layout {
             self.create_task_in_background(title);
         } else {
             self.create_event_in_background(title);
@@ -281,7 +284,7 @@ impl App {
         self.cursor_index = 0;
         self.inputting = false;
 
-        if self.tasks_visible {
+        if let AppLayout::Tasks(_) = self.app_layout {
             self.update_task_in_background(title);
         } else {
             self.update_event_in_background(title);
@@ -386,14 +389,11 @@ impl App {
 
         let (updating_task, updating_tasklist_id) = self.selected_task().unwrap().clone();
         let current_year = self.current_date.year();
-        let updated_task = match parse_input::parse_date(&title, current_year) {
-            (t, None) => Task {
+        let updated_task = match parse_input::parse_date_and_note(&title, current_year) {
+            (t, due, notes) => Task {
                 title: Some(t),
-                ..Task::default()
-            },
-            (t, Some(due)) => Task {
-                title: Some(t),
-                due: Some(due),
+                due: due,
+                notes: notes,
                 ..Task::default()
             },
         };
@@ -434,14 +434,11 @@ impl App {
         self.cursor_line = 0;
 
         let current_year = self.current_date.year();
-        let new_task = match parse_input::parse_date(&title, current_year) {
-            (t, None) => Task {
+        let new_task = match parse_input::parse_date_and_note(&title, current_year) {
+            (t, due, notes) => Task {
                 title: Some(t),
-                ..Task::default()
-            },
-            (t, Some(due)) => Task {
-                title: Some(t),
-                due: Some(due),
+                due: due,
+                notes: notes,
                 ..Task::default()
             },
         };
@@ -919,13 +916,21 @@ impl App {
                     .checked_sub_months(Months::new(12))
                     .unwrap()
             }
-            KeyCode::Char('D') => {
-                if self.tasks_visible {
+            KeyCode::Char('D') => match self.app_layout {
+                AppLayout::Tasks(_) => {
                     self.delete_selected_task();
-                } else if self.events_visible {
+                }
+                AppLayout::Events => {
                     self.delete_selected_event();
                 }
-            }
+                _ => {}
+            },
+            KeyCode::Enter => match self.app_layout {
+                AppLayout::Tasks(false) => {
+                    self.app_layout = AppLayout::Tasks(true);
+                }
+                _ => {}
+            },
             KeyCode::Char('E') => self.toggle_event_visibility(),
             KeyCode::Char('T') => self.toggle_tasks_visibility(),
             KeyCode::Char('t') => self.current_date = self.today,
@@ -937,87 +942,118 @@ impl App {
     }
 
     fn add_or_update_event(&mut self) {
-        if self.tasks_visible {
-            self.updating_event_or_task = true;
-            self.input_buffer = self
-                .selected_task()
-                .unwrap()
-                .0
-                .title
-                .as_ref()
-                .unwrap()
-                .to_string();
-            self.cursor_index = self.char_count();
-            self.inputting = true
-        } else if self.events_visible {
-            self.updating_event_or_task = true;
-            self.input_buffer = self
-                .selected_event()
-                .unwrap()
-                .summary
-                .as_ref()
-                .unwrap()
-                .to_string();
-            self.cursor_index = self.char_count();
-            self.inputting = true
-        } else {
-            self.updating_event_or_task = false;
-            self.inputting = true
+        match self.app_layout {
+            AppLayout::Tasks(_) => {
+                self.updating_event_or_task = true;
+                self.input_buffer = self
+                    .selected_task()
+                    .unwrap()
+                    .0
+                    .title
+                    .as_ref()
+                    .unwrap()
+                    .to_string();
+                self.cursor_index = self.char_count();
+                self.inputting = true
+            }
+            AppLayout::Events => {
+                self.updating_event_or_task = true;
+                self.input_buffer = self
+                    .selected_event()
+                    .unwrap()
+                    .summary
+                    .as_ref()
+                    .unwrap()
+                    .to_string();
+                self.cursor_index = self.char_count();
+                self.inputting = true
+            }
+            _ => {
+                self.updating_event_or_task = false;
+                self.inputting = true
+            }
         }
     }
 
     fn exit(&mut self) {
-        if self.events_visible {
-            self.events_visible = false;
-        } else {
-            self.exit = true;
+        match self.app_layout {
+            AppLayout::Events => {
+                self.app_layout = AppLayout::Calendar;
+            }
+            AppLayout::Tasks(true) => {
+                self.app_layout = AppLayout::Tasks(false);
+            }
+            _ => {
+                self.exit = true;
+            }
         }
     }
 
     fn move_right(&mut self) {
-        if self.tasks_visible || self.events_visible {
-            return;
+        match self.app_layout {
+            AppLayout::Events | AppLayout::Tasks(_) => {
+                return;
+            }
+            _ => {
+                self.current_date = self.current_date.succ_opt().unwrap();
+            }
         }
-        self.current_date = self.current_date.succ_opt().unwrap();
     }
 
     fn move_left(&mut self) {
-        if self.tasks_visible || self.events_visible {
-            return;
+        match self.app_layout {
+            AppLayout::Events | AppLayout::Tasks(_) => {
+                return;
+            }
+            _ => {
+                self.current_date = self.current_date.pred_opt().unwrap();
+            }
         }
-        self.current_date = self.current_date.pred_opt().unwrap();
     }
 
     fn move_up(&mut self) {
-        if self.tasks_visible || self.events_visible {
-            if self.cursor_line > 0 {
-                self.cursor_line = self.cursor_line - 1;
+        match self.app_layout {
+            AppLayout::Events | AppLayout::Tasks(_) => {
+                if self.cursor_line > 0 {
+                    self.cursor_line = self.cursor_line - 1;
+                }
             }
-        } else {
-            self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
+            _ => {
+                self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
+            }
         }
     }
 
     fn move_down(&mut self) {
-        if self.tasks_visible {
-            if self.cursor_line < self.tasks_cache.len() - 1 {
-                self.cursor_line = self.cursor_line + 1;
+        match self.app_layout {
+            AppLayout::Tasks(_) => {
+                if self.cursor_line < self.tasks_cache.len() - 1 {
+                    self.cursor_line = self.cursor_line + 1;
+                }
             }
-        } else if self.events_visible {
-            if self.cursor_line < self.current_day_events().len() - 1 {
-                self.cursor_line = self.cursor_line + 1;
+            AppLayout::Events => {
+                if self.cursor_line < self.current_day_events().len() - 1 {
+                    self.cursor_line = self.cursor_line + 1;
+                }
             }
-        } else {
-            self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
+            _ => {
+                self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
+            }
         }
     }
 
     fn toggle_event_visibility(&mut self) {
-        self.events_visible = !self.events_visible;
+        self.app_layout = match self.app_layout {
+            AppLayout::Events => AppLayout::Calendar,
+            _ => AppLayout::Events,
+        };
         self.cursor_line = 0;
     }
     fn toggle_tasks_visibility(&mut self) {
-        self.tasks_visible = !self.tasks_visible;
+        self.app_layout = match self.app_layout {
+            AppLayout::Tasks(_) => AppLayout::Calendar,
+            _ => AppLayout::Tasks(false),
+        };
         self.cursor_line = 0;
     }
 }
@@ -1034,18 +1070,17 @@ impl Widget for &App {
         )
         .split(area);
 
-        let main_area = if self.tasks_visible {
-            Layout::new(
+        let main_area = match self.app_layout {
+            AppLayout::Tasks(_) => Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([70, 30]),
             )
-            .split(main_chunks[1])
-        } else {
-            Layout::new(
+            .split(main_chunks[1]),
+            _ => Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([100, 0]),
             )
-            .split(main_chunks[1])
+            .split(main_chunks[1]),
         };
 
         // Title area
@@ -1172,8 +1207,8 @@ impl Widget for &App {
                 let current_cell = drawn_dates[row_index][col_index];
                 let current_date = current_cell.0.day();
                 let is_cursor_here = cursor_date == current_date && current_cell.1;
-                let focus_not_on_calendar = self.tasks_visible || self.events_visible;
-                let day = if is_cursor_here && (!focus_not_on_calendar) {
+                let focus_on_calendar = matches!(self.app_layout, AppLayout::Calendar);
+                let day = if is_cursor_here && focus_on_calendar {
                     ratatui::widgets::ListItem::new(format!("{}{:<30}", current_date, " "))
                         .on_dark_gray()
                 } else {
@@ -1268,103 +1303,107 @@ impl Widget for &App {
             }
         }
 
-        if self.events_visible {
-            let event_area_horizontal = Layout::new(
-                Direction::Vertical,
-                Constraint::from_percentages([16, 68, 16]),
-            )
-            .split(main_area[0]);
-            let event_area = Layout::new(
-                Direction::Horizontal,
-                Constraint::from_percentages([20, 60, 20]),
-            )
-            .split(event_area_horizontal[1]);
-            Clear::default().render(event_area[1], buf);
+        match self.app_layout {
+            AppLayout::Events => {
+                let event_area_horizontal = Layout::new(
+                    Direction::Vertical,
+                    Constraint::from_percentages([16, 68, 16]),
+                )
+                .split(main_area[0]);
+                let event_area = Layout::new(
+                    Direction::Horizontal,
+                    Constraint::from_percentages([20, 60, 20]),
+                )
+                .split(event_area_horizontal[1]);
+                Clear::default().render(event_area[1], buf);
 
-            let empty_vec = &vec![];
-            let today_events = self
-                .events_cache
-                .get(&self.current_date)
-                .unwrap_or(empty_vec);
+                let empty_vec = &vec![];
+                let today_events = self
+                    .events_cache
+                    .get(&self.current_date)
+                    .unwrap_or(empty_vec);
 
-            let items: Vec<ratatui::widgets::ListItem> = if today_events.is_empty() {
-                vec![]
-            } else {
-                today_events
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ev)| {
-                        let title = ev.summary.as_deref().unwrap_or("Untitled");
-                        let start_time = ev
-                            .start
-                            .as_ref()
-                            .and_then(|s| s.date_time)
-                            .map(|dt| dt.with_timezone(&self.app_tz).format(" %H:%M ").to_string())
-                            .unwrap_or(" ".to_string());
-                        let end_time = ev
-                            .end
-                            .as_ref()
-                            .and_then(|s| s.date_time)
-                            .map(|dt| {
-                                dt.with_timezone(&self.app_tz)
-                                    .format("- %H:%M ")
-                                    .to_string()
-                            })
-                            .unwrap_or("".to_string());
-                        let mut item = ratatui::widgets::ListItem::new(format!(
-                            "{start_time}{end_time}{title}"
-                        ));
-                        if !self.tasks_visible && Some(i) == self.selected_event_index() {
-                            item = item.bg(Color::DarkGray).fg(Color::White);
-                        };
-                        item
-                    })
-                    .collect()
-            };
+                let items: Vec<ratatui::widgets::ListItem> = if today_events.is_empty() {
+                    vec![]
+                } else {
+                    today_events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ev)| {
+                            let title = ev.summary.as_deref().unwrap_or("Untitled");
+                            let start_time = ev
+                                .start
+                                .as_ref()
+                                .and_then(|s| s.date_time)
+                                .map(|dt| {
+                                    dt.with_timezone(&self.app_tz).format(" %H:%M ").to_string()
+                                })
+                                .unwrap_or(" ".to_string());
+                            let end_time = ev
+                                .end
+                                .as_ref()
+                                .and_then(|s| s.date_time)
+                                .map(|dt| {
+                                    dt.with_timezone(&self.app_tz)
+                                        .format("- %H:%M ")
+                                        .to_string()
+                                })
+                                .unwrap_or("".to_string());
+                            let mut item = ratatui::widgets::ListItem::new(format!(
+                                "{start_time}{end_time}{title}"
+                            ));
+                            if Some(i) == self.selected_event_index() {
+                                item = item.bg(Color::DarkGray).fg(Color::White);
+                            };
+                            item
+                        })
+                        .collect()
+                };
 
-            ratatui::widgets::List::new(items)
-                .block(Block::bordered().title("Events"))
-                .render(event_area[1], buf);
+                ratatui::widgets::List::new(items)
+                    .block(Block::bordered().title("Events"))
+                    .render(event_area[1], buf);
+            }
+
+            AppLayout::Tasks(notes_visible) => {
+                let tasks = self.tasks_cache.clone();
+                let items: Vec<Span> = {
+                    tasks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ev)| {
+                            let title = ev.0.title.as_deref().unwrap_or("Untitled");
+                            let time = match ev.0.due.as_deref() {
+                                Some(duedate) => match DateTime::parse_from_rfc3339(duedate) {
+                                    Ok(e) => e.date_naive().format("%Y/%m/%d ").to_string(),
+                                    Err(_) => "".to_string(),
+                                },
+                                None => "".to_string(),
+                            };
+                            let mut item = match ev.0.completed {
+                                Some(_) => Span::raw(format!("{time}{title}")).dark_gray(),
+                                None => Span::raw(format!("{time}{title}")),
+                            };
+                            if Some(i) == self.selected_task_index() {
+                                item = item.bg(Color::DarkGray).fg(Color::White);
+                            };
+                            item
+                        })
+                        .collect()
+                };
+
+                ratatui::widgets::List::new(items)
+                    .block(Block::bordered().title("Tasks".bold().into_centered_line()))
+                    .render(
+                        main_area[1].inner(ratatui::layout::Margin {
+                            vertical: 1,
+                            horizontal: 5,
+                        }),
+                        buf,
+                    );
+            }
+            _ => {}
         }
-
-        if self.tasks_visible {
-            let tasks = self.tasks_cache.clone();
-            let items: Vec<Span> = {
-                tasks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ev)| {
-                        let title = ev.0.title.as_deref().unwrap_or("Untitled");
-                        let time = match ev.0.due.as_deref() {
-                            Some(duedate) => match DateTime::parse_from_rfc3339(duedate) {
-                                Ok(e) => e.date_naive().format("%Y/%m/%d ").to_string(),
-                                Err(_) => "".to_string(),
-                            },
-                            None => "".to_string(),
-                        };
-                        let mut item = match ev.0.completed {
-                            Some(_) => Span::raw(format!("{time}{title}")).dark_gray(),
-                            None => Span::raw(format!("{time}{title}")),
-                        };
-                        if Some(i) == self.selected_task_index() {
-                            item = item.bg(Color::DarkGray).fg(Color::White);
-                        };
-                        item
-                    })
-                    .collect()
-            };
-
-            ratatui::widgets::List::new(items)
-                .block(Block::bordered().title("Tasks".bold().into_centered_line()))
-                .render(
-                    main_area[1].inner(ratatui::layout::Margin {
-                        vertical: 1,
-                        horizontal: 5,
-                    }),
-                    buf,
-                );
-        }
-
         // Bottom Area
 
         let bottom_area = Layout::new(
@@ -1396,7 +1435,7 @@ impl Widget for &App {
         // Text input area
 
         if self.inputting {
-            if self.tasks_visible {
+            if let AppLayout::Tasks(_) = self.app_layout {
                 Paragraph::new(" Tasks: ").render(bottom_area[0], buf)
             } else {
                 Paragraph::new(" Event: ").render(bottom_area[0], buf)
