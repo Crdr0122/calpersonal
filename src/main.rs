@@ -142,7 +142,6 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         use crossterm::event::{poll, read};
         use std::time::Duration;
-        // let args: Vec<String> = std::env::args().collect();
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
 
@@ -1498,13 +1497,24 @@ impl Widget for &App {
             } else {
                 Paragraph::new(" Event: ").render(bottom_area[0], buf)
             }
-            let cursor_char = "█";
 
+            let char_at_cursor = if let Some(ch) = self.input_buffer.chars().nth(self.cursor_index)
+            {
+                Span::raw(ch.to_string()).on_white().black()
+            } else {
+                Span::raw("█".to_string())
+            };
             let left: String = self.input_buffer.chars().take(self.cursor_index).collect();
-            let right: String = self.input_buffer.chars().skip(self.cursor_index).collect();
+            let right: String = self
+                .input_buffer
+                .chars()
+                .skip(self.cursor_index + 1)
+                .collect();
 
-            let input_box = Span::raw(format!("{}{}{}", left, cursor_char, right));
-            Paragraph::new(input_box).render(bottom_area[1], buf)
+            let input_left = Span::raw(left);
+            let input_right = Span::raw(right);
+            ratatui::text::Line::from(vec![input_left, char_at_cursor, input_right])
+                .render(bottom_area[1], buf)
         }
     }
 }
