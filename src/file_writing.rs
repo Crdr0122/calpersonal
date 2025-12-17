@@ -7,7 +7,7 @@ use std::fs::{read_to_string, write};
 const EVENTS_CACHE_FILE: &str = ".cache/calpersonal/calendar_cache/events_cache.json";
 const TASKS_CACHE_FILE: &str = ".cache/calpersonal/task_cache/tasks_cache.json";
 
-pub fn load_events_cache() -> HashMap<NaiveDate, Vec<api::Event>> {
+pub fn load_events_cache() -> HashMap<NaiveDate, Vec<(api::Event, String)>> {
     let secret_path = home_dir()
         .expect("Could not find home directory")
         .join(EVENTS_CACHE_FILE);
@@ -18,7 +18,7 @@ pub fn load_events_cache() -> HashMap<NaiveDate, Vec<api::Event>> {
     }
 }
 
-pub fn save_events_cache(cache: &HashMap<NaiveDate, Vec<api::Event>>) {
+pub fn save_events_cache(cache: &HashMap<NaiveDate, Vec<(api::Event, String)>>) {
     let secret_path = home_dir()
         .expect("Could not find home directory")
         .join(EVENTS_CACHE_FILE);

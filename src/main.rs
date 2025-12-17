@@ -32,7 +32,7 @@ struct App {
 
     // Calendar stuff
     event_hub: Option<CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    events_cache: HashMap<NaiveDate, Vec<api::Event>>, // date → events that day
+    events_cache: HashMap<NaiveDate, Vec<(api::Event, String)>>, // date → events that day
     task_hub: Option<TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     tasks_cache: Vec<(Task, String)>, // date → events that day
 
@@ -46,7 +46,8 @@ struct App {
     input_buffer: String,
     updating_event_or_task: bool,
 
-    events_update_rx: Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<api::Event>>>>,
+    events_update_rx:
+        Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<(api::Event, String)>>>>,
     tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(Task, String)>>>,
     needs_refresh: bool,
 
@@ -362,7 +363,11 @@ impl App {
         tokio::spawn(async move {
             let result = hub
                 .events()
-                .patch(updated_event, "primary", &current_event.id.unwrap())
+                .patch(
+                    updated_event,
+                    &current_event.1,
+                    &current_event.0.id.unwrap(),
+                )
                 .doit()
                 .await;
 
@@ -623,8 +628,8 @@ impl App {
         (grid, number_of_rows)
     }
 
-    fn current_day_events(&self) -> &[api::Event] {
-        static EMPTY: Vec<api::Event> = Vec::new();
+    fn current_day_events(&self) -> &[(api::Event, String)] {
+        static EMPTY: Vec<(api::Event, String)> = Vec::new();
         self.events_cache
             .get(&self.current_date)
             .map(|v| v.as_slice())
@@ -658,7 +663,7 @@ impl App {
         }
     }
 
-    fn selected_event(&self) -> Option<&api::Event> {
+    fn selected_event(&self) -> Option<&(api::Event, String)> {
         let idx = self.selected_event_index()?;
         self.current_day_events().get(idx)
     }
@@ -758,7 +763,7 @@ impl App {
             return;
         };
 
-        let Some(event_id) = event.id else {
+        let Some(event_id) = event.0.id else {
             return;
         };
 
@@ -772,7 +777,7 @@ impl App {
 
         // Spawn background deletion
         tokio::spawn(async move {
-            let result = hub.events().delete("primary", &event_id).doit().await;
+            let result = hub.events().delete(&event.1, &event_id).doit().await;
 
             let msg = match result {
                 Ok(_) => ("Event Deleted!".to_string(), StatusColor::Green),
@@ -810,44 +815,56 @@ impl App {
     async fn fetch_events(
         app_tz: FixedOffset,
         hub: &CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>,
-    ) -> Option<HashMap<NaiveDate, Vec<api::Event>>> {
-        match hub
-            .events()
-            .list("primary")
-            .single_events(true)
-            .order_by("startTime")
-            .doit()
-            .await
-        {
-            Ok((_, events_list)) => {
-                let mut map: HashMap<NaiveDate, Vec<api::Event>> = HashMap::new();
-                if let Some(items) = events_list.items {
-                    for event in items {
-                        let start_date_and_event = if let Some(start) = &event.start {
-                            if let Some(date_time_str) = start.date_time {
-                                // Convert to your local timezone and get the local date + time
-                                let local_dt = date_time_str.with_timezone(&app_tz);
-                                Some(local_dt.date_naive())
-                            } else if let Some(date_str) = start.date {
-                                Some(date_str)
-                            } else {
-                                None
+    ) -> Option<HashMap<NaiveDate, Vec<(api::Event, String)>>> {
+        let calendars = match hub.calendar_list().list().doit().await {
+            Ok((_, calendar_ids)) => calendar_ids.items.unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Failed to fetch calendars: {e:?}");
+                return None;
+            }
+        };
+
+        let mut map: HashMap<NaiveDate, Vec<(api::Event, String)>> = HashMap::new();
+
+        for entry in calendars {
+            if let Some(id) = entry.id {
+                match hub
+                    .events()
+                    .list("primary")
+                    .single_events(true)
+                    .order_by("startTime")
+                    .doit()
+                    .await
+                {
+                    Ok((_, events_list)) => {
+                        if let Some(items) = events_list.items {
+                            for event in items {
+                                let start_date_and_event = if let Some(start) = &event.start {
+                                    if let Some(date_time_str) = start.date_time {
+                                        // Convert to your local timezone and get the local date + time
+                                        let local_dt = date_time_str.with_timezone(&app_tz);
+                                        Some(local_dt.date_naive())
+                                    } else if let Some(date_str) = start.date {
+                                        Some(date_str)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(start_date) = start_date_and_event {
+                                    map.entry(start_date).or_default().push((event, id.clone()));
+                                }
                             }
-                        } else {
-                            None
-                        };
-                        if let Some(start_date) = start_date_and_event {
-                            map.entry(start_date).or_default().push(event);
                         }
                     }
+                    Err(e) => {
+                        eprintln!("Failed to fetch events: {e:?}");
+                    }
                 }
-                Some(map)
-            }
-            Err(e) => {
-                eprintln!("Failed to fetch events: {e:?}");
-                None
             }
         }
+        Some(map)
     }
 
     async fn fetch_tasks(
@@ -867,7 +884,6 @@ impl App {
                     Ok((_, tasks)) => {
                         if let Some(items) = tasks.items {
                             let tasks_with_list: Vec<(Task, String)> = items
-                                
                                 .iter()
                                 .map(|t| (t.clone(), tasklist_id.clone()))
                                 .collect();
@@ -962,6 +978,7 @@ impl App {
                 self.input_buffer = self
                     .selected_event()
                     .unwrap()
+                    .0
                     .summary
                     .as_ref()
                     .unwrap()
@@ -1225,15 +1242,15 @@ impl Widget for &App {
                     today_events
                         .iter()
                         .map(|ev| {
-                            let title = ev.summary.as_deref().unwrap_or("Untitled");
-                            let time = ev
-                                .start
-                                .as_ref()
-                                .and_then(|s| s.date_time)
-                                .map(|dt| {
-                                    dt.with_timezone(&self.app_tz).format("%H:%M ").to_string()
-                                })
-                                .unwrap_or("".to_string());
+                            let title = ev.0.summary.as_deref().unwrap_or("Untitled");
+                            let time =
+                                ev.0.start
+                                    .as_ref()
+                                    .and_then(|s| s.date_time)
+                                    .map(|dt| {
+                                        dt.with_timezone(&self.app_tz).format("%H:%M ").to_string()
+                                    })
+                                    .unwrap_or("".to_string());
                             let e = if current_cell.1 {
                                 Text::raw(format!("{time}{title}"))
                             } else {
@@ -1331,25 +1348,25 @@ impl Widget for &App {
                         .iter()
                         .enumerate()
                         .map(|(i, ev)| {
-                            let title = ev.summary.as_deref().unwrap_or("Untitled");
-                            let start_time = ev
-                                .start
-                                .as_ref()
-                                .and_then(|s| s.date_time)
-                                .map(|dt| {
-                                    dt.with_timezone(&self.app_tz).format(" %H:%M ").to_string()
-                                })
-                                .unwrap_or(" ".to_string());
-                            let end_time = ev
-                                .end
-                                .as_ref()
-                                .and_then(|s| s.date_time)
-                                .map(|dt| {
-                                    dt.with_timezone(&self.app_tz)
-                                        .format("- %H:%M ")
-                                        .to_string()
-                                })
-                                .unwrap_or("".to_string());
+                            let title = ev.0.summary.as_deref().unwrap_or("Untitled");
+                            let start_time =
+                                ev.0.start
+                                    .as_ref()
+                                    .and_then(|s| s.date_time)
+                                    .map(|dt| {
+                                        dt.with_timezone(&self.app_tz).format(" %H:%M ").to_string()
+                                    })
+                                    .unwrap_or(" ".to_string());
+                            let end_time =
+                                ev.0.end
+                                    .as_ref()
+                                    .and_then(|s| s.date_time)
+                                    .map(|dt| {
+                                        dt.with_timezone(&self.app_tz)
+                                            .format("- %H:%M ")
+                                            .to_string()
+                                    })
+                                    .unwrap_or("".to_string());
                             let mut item = ratatui::widgets::ListItem::new(format!(
                                 "{start_time}{end_time}{title}"
                             ));
