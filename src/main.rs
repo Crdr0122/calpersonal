@@ -142,29 +142,30 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         use crossterm::event::{poll, read};
         use std::time::Duration;
-        while !self.exit {
-            terminal.draw(|frame| self.draw(frame))?;
+        // let args: Vec<String> = std::env::args().collect();
+            while !self.exit {
+                terminal.draw(|frame| self.draw(frame))?;
 
-            if poll(Duration::from_millis(250))? {
-                match read()? {
-                    Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                        if self.inputting {
-                            self.input_handle_key_event(key_event);
-                        } else {
-                            self.handle_key_event(key_event);
+                if poll(Duration::from_millis(250))? {
+                    match read()? {
+                        Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                            if self.inputting {
+                                self.input_handle_key_event(key_event);
+                            } else {
+                                self.handle_key_event(key_event);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                }
+
+                self.check_updates();
+
+                if self.needs_refresh {
+                    self.start_background_refresh();
+                    self.needs_refresh = false;
                 }
             }
-
-            self.check_updates();
-
-            if self.needs_refresh {
-                self.start_background_refresh();
-                self.needs_refresh = false;
-            }
-        }
         Ok(())
     }
 
@@ -828,9 +829,11 @@ impl App {
 
         for entry in calendars {
             if let Some(id) = entry.id {
+                let re_encoded_id = id.replace("@", "%40").replace("#", "%23");
                 match hub
                     .events()
-                    .list("primary")
+                    .list(&re_encoded_id)
+                    .add_scope(google_calendar3::api::Scope::Full)
                     .single_events(true)
                     .order_by("startTime")
                     .doit()
@@ -853,7 +856,7 @@ impl App {
                                     None
                                 };
                                 if let Some(start_date) = start_date_and_event {
-                                    map.entry(start_date).or_default().push((event, id.clone()));
+                                    map.entry(start_date).or_default().push((event, re_encoded_id.clone()));
                                 }
                             }
                         }
