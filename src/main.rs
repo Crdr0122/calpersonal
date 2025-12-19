@@ -175,14 +175,7 @@ impl App {
                 self.insert_char_at(ch, self.cursor_index);
                 self.cursor_index += 1;
             }
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                if self.updating_event_or_task {
-                    self.updating_event_or_task = false;
-                    self.update_task_or_event()
-                } else {
-                    self.create_task_or_event()
-                }
-            }
+            (KeyModifiers::NONE, KeyCode::Enter) => self.update_or_create_task_or_event(),
             (KeyModifiers::NONE, KeyCode::Left) | (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
                 if self.cursor_index > 0 {
                     self.cursor_index -= 1
@@ -273,24 +266,31 @@ impl App {
         }
     }
 
-    fn update_task_or_event(&mut self) {
-        // Trimming and checking empty is already done here
+    fn update_or_create_task_or_event(&mut self) {
+        // Trimming and checking empty is done here
         if self.input_buffer.trim().is_empty() {
             self.cancel_input();
             return;
         }
+        if self.updating_event_or_task {
+            self.updating_event_or_task = false;
+            let title = self.input_buffer.trim().to_string();
+            self.input_buffer.clear();
+            self.inputting = false;
 
-        let title = self.input_buffer.trim().to_string();
-        self.input_buffer.clear();
-        self.inputting = false;
-
-        if let AppLayout::Tasks(_) = self.app_layout {
-            self.update_task_in_background(title);
-        } else {
-            self.update_event_in_background(title);
+            if let AppLayout::Tasks(_) = self.app_layout {
+                if !self.tasks_cache.is_empty() {
+                    self.update_task_in_background(title);
+                    return;
+                }
+            } else {
+                if !self.events_cache.is_empty() {
+                    self.update_event_in_background(title);
+                    return;
+                }
+            }
         }
-        // Change cursor index in the end
-        self.cursor_index = 0;
+        self.create_task_or_event()
     }
 
     fn update_event_in_background(&mut self, title: String) {
@@ -958,43 +958,114 @@ impl App {
             KeyCode::Char('R') => self.needs_refresh = true,
             KeyCode::Char('o') => self.inputting = true,
             KeyCode::Char('a') => self.add_or_update_event(),
+            KeyCode::Char(' ') => self.toggle_task_completed(),
+            KeyCode::Char('L') => self.clear_completed_tasks(),
+            _ => {}
+        }
+    }
+
+    fn toggle_task_completed(&mut self) {
+        match self.app_layout {
+            AppLayout::Tasks(_) => {
+                let Some(task) = self.selected_task().cloned() else {
+                    return;
+                };
+                let Some(task_id) = task.0.id else {
+                    return;
+                };
+                let Some(hub) = self.task_hub.as_ref().cloned() else {
+                    self.changing_status = ("Offline".to_string(), StatusColor::White);
+                    return;
+                };
+                let Some(completed_status) = task.0.status else {
+                    return;
+                };
+                let new_completed = match completed_status.as_str() {
+                    "completed" => Task {
+                        status: Some("needsAction".to_string()),
+                        ..Default::default()
+                    },
+                    "needsAction" => Task {
+                        status: Some("completed".to_string()),
+                        ..Default::default()
+                    },
+                    _ => Task::default(),
+                };
+
+                let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+                self.changing_status = ("Toggling...".to_string(), StatusColor::Yellow);
+
+                tokio::spawn(async move {
+                    let result = hub
+                        .tasks()
+                        .patch(new_completed, &task.1, &task_id)
+                        .doit()
+                        .await;
+                    let msg = match result {
+                        Ok(_) => ("Completed".to_string(), StatusColor::Green),
+                        Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
+                    };
+                    let _ = tx.send(msg).await.ok();
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_completed_tasks(&mut self) {
+        match self.app_layout {
+            AppLayout::Tasks(_) => {
+                let Some(task) = self.selected_task().cloned() else {
+                    return;
+                };
+                let Some(hub) = self.task_hub.as_ref().cloned() else {
+                    self.changing_status = ("Offline".to_string(), StatusColor::White);
+                    return;
+                };
+                let tx = self.change_feedback_tx.as_ref().unwrap().clone();
+                self.changing_status = ("Clearing...".to_string(), StatusColor::Yellow);
+
+                tokio::spawn(async move {
+                    let result = hub
+                        .tasks()
+                        .clear(&task.1)
+                        .doit()
+                        .await;
+                    let msg = match result {
+                        Ok(_) => ("Cleared".to_string(), StatusColor::Green),
+                        Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
+                    };
+                    let _ = tx.send(msg).await.ok();
+                });
+            }
             _ => {}
         }
     }
 
     fn add_or_update_event(&mut self) {
+        self.updating_event_or_task = true;
         match self.app_layout {
             AppLayout::Tasks(_) => {
-                self.updating_event_or_task = true;
-                self.input_buffer = self
-                    .selected_task()
-                    .unwrap()
-                    .0
-                    .title
-                    .as_ref()
-                    .unwrap()
-                    .to_string();
-                self.cursor_index = self.char_count();
-                self.inputting = true
+                if let Some(selected_task) = self.selected_task() {
+                    self.input_buffer = selected_task.0.title.as_ref().unwrap().to_string();
+                    self.cursor_index = self.char_count();
+                    self.inputting = true;
+                    return;
+                }
             }
             AppLayout::Events => {
-                self.updating_event_or_task = true;
-                self.input_buffer = self
-                    .selected_event()
-                    .unwrap()
-                    .0
-                    .summary
-                    .as_ref()
-                    .unwrap()
-                    .to_string();
-                self.cursor_index = self.char_count();
-                self.inputting = true
+                if let Some(selected_event) = self.selected_event() {
+                    self.input_buffer = selected_event.0.summary.as_ref().unwrap().to_string();
+                    self.cursor_index = self.char_count();
+                    self.inputting = true;
+                    return;
+                }
             }
-            _ => {
-                self.updating_event_or_task = false;
-                self.inputting = true
-            }
+            _ => {}
         }
+        // 'a' adds event when on calendar
+        self.updating_event_or_task = false;
+        self.inputting = true
     }
 
     fn exit(&mut self) {
@@ -1424,7 +1495,7 @@ impl Widget for &App {
                         buf,
                     );
 
-                if notes_visible {
+                if notes_visible && let Some(selected_task) = self.selected_task() {
                     let task_area_horizontal = Layout::new(
                         Direction::Vertical,
                         Constraint::from_percentages([16, 68, 16]),
@@ -1437,21 +1508,9 @@ impl Widget for &App {
                     .split(task_area_horizontal[1]);
                     Clear::default().render(task_area[1], buf);
 
-                    let task_notes = self
-                        .selected_task()
-                        .unwrap()
-                        .0
-                        .notes
-                        .clone()
-                        .unwrap_or("".to_string());
+                    let task_notes = selected_task.0.notes.clone().unwrap_or("".to_string());
 
-                    let task_title = self
-                        .selected_task()
-                        .unwrap()
-                        .0
-                        .title
-                        .clone()
-                        .unwrap_or("".to_string());
+                    let task_title = selected_task.0.title.clone().unwrap_or("".to_string());
 
                     Paragraph::new(task_notes)
                         .wrap(ratatui::widgets::Wrap { trim: true })
