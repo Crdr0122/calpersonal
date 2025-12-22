@@ -279,15 +279,11 @@ impl App {
             self.inputting = false;
 
             if let AppLayout::Tasks(_) = self.app_layout {
-                if !self.tasks_cache.is_empty() {
-                    self.update_task_in_background(title);
-                    return;
-                }
+                self.update_task_in_background(title);
+                return;
             } else {
-                if !self.events_cache.is_empty() {
-                    self.update_event_in_background(title);
-                    return;
-                }
+                self.update_event_in_background(title);
+                return;
             }
         }
         self.create_task_or_event()
@@ -563,10 +559,7 @@ impl App {
             let result = hub.events().insert(new_event, "primary").doit().await;
 
             let msg = match result {
-                Ok((_, _)) => {
-                    // You could update cache with real ID here if you track it
-                    ("Event created!".to_string(), StatusColor::Green)
-                }
+                Ok((_, _)) => ("Event created!".to_string(), StatusColor::Green),
                 Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
             };
             let _ = tx.send(msg).await;
@@ -698,7 +691,9 @@ impl App {
             self.tasks_update_rx = Some(rx);
             self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
-                if let Some(new_tasks) = App::fetch_tasks(&hub).await {
+                if let Some(mut new_tasks) = App::fetch_tasks(&hub).await {
+                    new_tasks
+                        .sort_unstable_by_key(|t| t.0.status.clone().unwrap_or("".to_string()));
                     file_writing::save_tasks_cache(&new_tasks);
                     let _ = tx.send(new_tasks).await;
                 }
@@ -1026,11 +1021,7 @@ impl App {
                 self.changing_status = ("Clearing...".to_string(), StatusColor::Yellow);
 
                 tokio::spawn(async move {
-                    let result = hub
-                        .tasks()
-                        .clear(&task.1)
-                        .doit()
-                        .await;
+                    let result = hub.tasks().clear(&task.1).doit().await;
                     let msg = match result {
                         Ok(_) => ("Cleared".to_string(), StatusColor::Green),
                         Err(e) => (format!("Failed: {e}").to_string(), StatusColor::Red),
@@ -1417,7 +1408,7 @@ impl Widget for &App {
                     .unwrap_or(empty_vec);
 
                 let items: Vec<ratatui::widgets::ListItem> = if today_events.is_empty() {
-                    vec![]
+                    Vec::new()
                 } else {
                     today_events
                         .iter()
