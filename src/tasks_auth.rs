@@ -8,7 +8,7 @@ pub async fn get_tasks_hub()
 -> Result<TasksHub<HttpsConnector<connect::HttpConnector>>, Box<dyn Error>> {
     let secret_path = home_dir()
         .expect("Could not find home directory")
-        .join(".cache/calpersonal/clientsecret.json");
+        .join(".config/calpersonal/clientsecret.json");
 
     let token_path = home_dir()
         .expect("Could not find home directory")
