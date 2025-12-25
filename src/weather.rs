@@ -23,14 +23,16 @@ pub fn get_weather_icon(icon: String) -> String {
  ― (   ) ―
     `-’
    /   \ 
-".to_string(),
+"
+        .to_string(),
         "02d" | "02n" => r#"
   \  /      
 _ /"".-.    
   \_(   ).  
   /(___(__) 
  
-"#.to_string(),
+"#
+        .to_string(),
         "03d" | "03n" | "04d" | "04n" => r"
 
    .-.   
@@ -53,22 +55,32 @@ _ /"".-.
  (___(__)
  ,‘,‘,‘,‘
  ,’,’,’,’
-".to_string(),
+"
+        .to_string(),
         "11d" | "11n" => r"
+   .-.	
+  ( _ ).  
+ (_./ /_)
+ ‘ ‘/_ ,'
+ ,‘,‘/'‘,
+"
+        .to_string(),
+        "13d" | "13n" => r"
    .-.   
   (   ). 
  (___(__)
   *  *  *
  *  *  *
-".to_string(),
-        "13d" | "13n" => "󰖘".to_string(),
+"
+        .to_string(),
         "50d" | "50n" => r"
 
 _ - _ - _ 
  _ - _ - _ 
 _ - _ - _ 
 
-".to_string(),
+"
+        .to_string(),
         _ => "".to_string(),
     }
 }

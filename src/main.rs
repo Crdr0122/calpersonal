@@ -1582,10 +1582,10 @@ impl Widget for &App {
                 let weather_area = Layout::new(
                     Direction::Horizontal,
                     [
-                        Constraint::Fill(2),
-                        Constraint::Length(20),
                         Constraint::Fill(3),
-                        Constraint::Fill(2),
+                        Constraint::Length(20),
+                        Constraint::Fill(5),
+                        Constraint::Fill(3),
                     ],
                 )
                 .split(weather_area_horizontal[1]);
@@ -1598,26 +1598,29 @@ impl Widget for &App {
                     let humidity = current_weather.main.humidity;
                     let wind = current_weather.wind.speed;
                     let location = current_weather.name.clone();
-                    let visibility = current_weather.visibility.unwrap_or(10000);
-                    let precip = current_weather
-                        .rain
-                        .as_ref()
-                        .and_then(|p| p.one_hour)
-                        .unwrap_or(0.0);
+                    // let visibility = current_weather.visibility.unwrap_or(10000);
+                    // let precip = current_weather
+                    //     .rain
+                    //     .as_ref()
+                    //     .and_then(|p| p.one_hour)
+                    //     .unwrap_or(0.0);
                     let weather = &current_weather.weather[0];
                     let general_weather = weather.main.clone();
+                    let detailed_weather = weather.description.clone();
                     let icon = weather::get_weather_icon(weather.icon.clone());
 
                     let text = vec![
                         Line::raw(format!("Location     >   {location}")),
-                        Line::raw(format!("Weather      >   {general_weather}")),
+                        Line::raw(format!(
+                            "Weather      >   {general_weather} ({detailed_weather})"
+                        )),
                         Line::raw(format!(
                             "Temperature  >   {temperature}°C (feels like {feels_like}°C)"
                         )),
                         Line::raw(format!("Wind         >   {wind}m/s")),
                         Line::raw(format!("Humidity     >   {humidity}%")),
-                        Line::raw(format!("Precip       >   {precip}mm/h")),
-                        Line::raw(format!("Visibility   >   {visibility}m")),
+                        // Line::raw(format!("Precip       >   {precip}mm/h")),
+                        // Line::raw(format!("Visibility   >   {visibility}m")),
                     ];
                     ratatui::widgets::Paragraph::new(text)
                         .block(
