@@ -9,7 +9,6 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use google_calendar3::{CalendarHub, api};
 use google_tasks1::{TasksHub, api::Task};
 use hyper_util::client::legacy::connect;
-use openweathermap_client::models::CurrentWeather;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -24,10 +23,11 @@ use ratatui::{
 use rustls;
 use std::collections::HashMap;
 use std::io;
+use weather::OneCallResponse;
 
 struct App {
     config: Option<config::Config>,
-    app_layout: AppLayout,
+    app_layout: MainArea,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     cursor_line: usize,
@@ -45,8 +45,9 @@ struct App {
     refreshing_status: (String, StatusColor),
     changing_status: (String, StatusColor),
 
-    weather_rx: Option<tokio::sync::mpsc::Receiver<CurrentWeather>>,
-    weather: Option<CurrentWeather>,
+    weather_rx: Option<tokio::sync::mpsc::Receiver<OneCallResponse>>,
+    onecall_weather: Option<weather::OneCallResponse>,
+    weather_day: usize,
 
     inputting: bool,
     cursor_index: usize,
@@ -73,7 +74,6 @@ struct App {
     >,
 }
 
-#[derive(PartialEq)]
 enum AuthStatus {
     Authenticating,
     Online,
@@ -87,7 +87,7 @@ enum StatusColor {
     Red,
     White,
 }
-enum AppLayout {
+enum MainArea {
     Calendar,
     Events,
     Tasks(bool),
@@ -117,7 +117,7 @@ impl App {
             config: config::parse_config(),
             current_date: today,
             today: today,
-            app_layout: AppLayout::Calendar,
+            app_layout: MainArea::Calendar,
             cursor_line: 0,
             app_tz,
             exit: false,
@@ -130,7 +130,8 @@ impl App {
             changing_status: (String::new(), StatusColor::White),
 
             weather_rx: None,
-            weather: None,
+            onecall_weather: None,
+            weather_day: 1,
 
             change_feedback_tx: Some(deletion_feedback_tx),
             change_feedback_rx: Some(deletion_feedback_rx),
@@ -273,7 +274,7 @@ impl App {
         self.cursor_index = 0;
         self.inputting = false;
 
-        if let AppLayout::Tasks(_) = self.app_layout {
+        if let MainArea::Tasks(_) = self.app_layout {
             self.create_task_in_background(title);
         } else {
             self.create_event_in_background(title);
@@ -292,7 +293,7 @@ impl App {
             self.input_buffer.clear();
             self.inputting = false;
 
-            if let AppLayout::Tasks(_) = self.app_layout {
+            if let MainArea::Tasks(_) = self.app_layout {
                 self.update_task_in_background(title);
                 return;
             } else {
@@ -733,7 +734,7 @@ impl App {
             let co = country.clone();
             tokio::spawn(async move {
                 if let Some(current_weather) =
-                    weather::get_weather(a.to_string(), c.to_string(), co.to_string()).await
+                    weather::fetch_weather(&a, c.to_string(), co.to_string()).await
                 {
                     let _ = tx.send(current_weather).await;
                 }
@@ -757,7 +758,7 @@ impl App {
 
         if let Some(rx) = &mut self.weather_rx {
             if let Ok(w) = rx.try_recv() {
-                self.weather = Some(w);
+                self.onecall_weather = Some(w);
             }
         }
 
@@ -954,18 +955,8 @@ impl App {
             KeyCode::Char('l') => self.move_right(),
             KeyCode::Char('k') => self.move_up(),
             KeyCode::Char('j') => self.move_down(),
-            KeyCode::Char('>') => {
-                self.current_date = self
-                    .current_date
-                    .checked_add_months(Months::new(1))
-                    .unwrap()
-            }
-            KeyCode::Char('<') => {
-                self.current_date = self
-                    .current_date
-                    .checked_sub_months(Months::new(1))
-                    .unwrap()
-            }
+            KeyCode::Char('>') => self.add_month_or_weather(),
+            KeyCode::Char('<') => self.sub_month_or_weather(),
             KeyCode::Char('y') => {
                 self.current_date = self
                     .current_date
@@ -979,17 +970,17 @@ impl App {
                     .unwrap()
             }
             KeyCode::Char('D') => match self.app_layout {
-                AppLayout::Tasks(_) => {
+                MainArea::Tasks(_) => {
                     self.delete_selected_task();
                 }
-                AppLayout::Events => {
+                MainArea::Events => {
                     self.delete_selected_event();
                 }
                 _ => {}
             },
             KeyCode::Enter => match self.app_layout {
-                AppLayout::Tasks(false) => {
-                    self.app_layout = AppLayout::Tasks(true);
+                MainArea::Tasks(false) => {
+                    self.app_layout = MainArea::Tasks(true);
                 }
                 _ => {}
             },
@@ -1008,16 +999,49 @@ impl App {
 
     fn toggle_weather(&mut self) {
         match self.app_layout {
-            AppLayout::Weather => self.app_layout = AppLayout::Calendar,
-            AppLayout::Calendar | AppLayout::Tasks(_) | AppLayout::Events => {
-                self.app_layout = AppLayout::Weather
+            MainArea::Weather => self.app_layout = MainArea::Calendar,
+            MainArea::Calendar | MainArea::Tasks(_) | MainArea::Events => {
+                self.weather_day = 1;
+                self.app_layout = MainArea::Weather
             }
         };
     }
 
+    fn add_month_or_weather(&mut self) {
+        match self.app_layout {
+            MainArea::Weather => {
+                if self.weather_day < 6 {
+                    self.weather_day += 1
+                }
+            }
+            MainArea::Calendar | MainArea::Tasks(_) | MainArea::Events => {
+                self.current_date = self
+                    .current_date
+                    .checked_add_months(Months::new(1))
+                    .unwrap()
+            }
+        }
+    }
+
+    fn sub_month_or_weather(&mut self) {
+        match self.app_layout {
+            MainArea::Weather => {
+                if self.weather_day > 1 {
+                    self.weather_day -= 1
+                }
+            }
+            MainArea::Calendar | MainArea::Tasks(_) | MainArea::Events => {
+                self.current_date = self
+                    .current_date
+                    .checked_sub_months(Months::new(1))
+                    .unwrap()
+            }
+        }
+    }
+
     fn toggle_task_completed(&mut self) {
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 let Some(task) = self.selected_task().cloned() else {
                     return;
                 };
@@ -1065,7 +1089,7 @@ impl App {
 
     fn clear_completed_tasks(&mut self) {
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 let Some(task) = self.selected_task().cloned() else {
                     return;
                 };
@@ -1092,7 +1116,7 @@ impl App {
     fn add_or_update_event(&mut self) {
         self.updating_event_or_task = true;
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 if let Some(selected_task) = self.selected_task() {
                     self.input_buffer = selected_task.0.title.as_ref().unwrap().to_string();
                     self.cursor_index = self.char_count();
@@ -1100,7 +1124,7 @@ impl App {
                     return;
                 }
             }
-            AppLayout::Events => {
+            MainArea::Events => {
                 if let Some(selected_event) = self.selected_event() {
                     self.input_buffer = selected_event.0.summary.as_ref().unwrap().to_string();
                     self.cursor_index = self.char_count();
@@ -1108,7 +1132,7 @@ impl App {
                     return;
                 }
             }
-            AppLayout::Calendar | AppLayout::Weather => {}
+            MainArea::Calendar | MainArea::Weather => {}
         }
         // 'a' adds event when on calendar
         self.updating_event_or_task = false;
@@ -1117,13 +1141,13 @@ impl App {
 
     fn exit(&mut self) {
         match self.app_layout {
-            AppLayout::Events | AppLayout::Weather => {
-                self.app_layout = AppLayout::Calendar;
+            MainArea::Events | MainArea::Weather => {
+                self.app_layout = MainArea::Calendar;
             }
-            AppLayout::Tasks(true) => {
-                self.app_layout = AppLayout::Tasks(false);
+            MainArea::Tasks(true) => {
+                self.app_layout = MainArea::Tasks(false);
             }
-            AppLayout::Calendar | AppLayout::Tasks(false) => {
+            MainArea::Calendar | MainArea::Tasks(false) => {
                 self.exit = true;
             }
         }
@@ -1131,72 +1155,72 @@ impl App {
 
     fn move_right(&mut self) {
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 return;
             }
-            AppLayout::Calendar | AppLayout::Events => {
+            MainArea::Calendar | MainArea::Events => {
                 self.current_date = self.current_date.succ_opt().unwrap();
             }
-            AppLayout::Weather => {}
+            MainArea::Weather => {}
         }
     }
 
     fn move_left(&mut self) {
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 return;
             }
-            AppLayout::Calendar | AppLayout::Events => {
+            MainArea::Calendar | MainArea::Events => {
                 self.current_date = self.current_date.pred_opt().unwrap();
             }
-            AppLayout::Weather => {}
+            MainArea::Weather => {}
         }
     }
 
     fn move_up(&mut self) {
         match self.app_layout {
-            AppLayout::Events | AppLayout::Tasks(_) => {
+            MainArea::Events | MainArea::Tasks(_) => {
                 if self.cursor_line > 0 {
                     self.cursor_line = self.cursor_line - 1;
                 }
             }
-            AppLayout::Calendar => {
+            MainArea::Calendar => {
                 self.current_date = self.current_date.checked_sub_days(Days::new(7)).unwrap();
             }
-            AppLayout::Weather => {}
+            MainArea::Weather => {}
         }
     }
 
     fn move_down(&mut self) {
         match self.app_layout {
-            AppLayout::Tasks(_) => {
+            MainArea::Tasks(_) => {
                 if self.cursor_line < self.tasks_cache.len() - 1 {
                     self.cursor_line = self.cursor_line + 1;
                 }
             }
-            AppLayout::Events => {
+            MainArea::Events => {
                 if self.cursor_line < self.current_day_events().len() - 1 {
                     self.cursor_line = self.cursor_line + 1;
                 }
             }
-            AppLayout::Calendar => {
+            MainArea::Calendar => {
                 self.current_date = self.current_date.checked_add_days(Days::new(7)).unwrap();
             }
-            AppLayout::Weather => {}
+            MainArea::Weather => {}
         }
     }
 
     fn toggle_event_visibility(&mut self) {
         self.app_layout = match self.app_layout {
-            AppLayout::Events => AppLayout::Calendar,
-            _ => AppLayout::Events,
+            MainArea::Events => MainArea::Calendar,
+            _ => MainArea::Events,
         };
         self.cursor_line = 0;
     }
     fn toggle_tasks_visibility(&mut self) {
         self.app_layout = match self.app_layout {
-            AppLayout::Tasks(_) => AppLayout::Calendar,
-            _ => AppLayout::Tasks(false),
+            MainArea::Tasks(_) => MainArea::Calendar,
+            _ => MainArea::Tasks(false),
         };
         self.cursor_line = 0;
     }
@@ -1215,12 +1239,12 @@ impl Widget for &App {
         .split(area);
 
         let main_area = match self.app_layout {
-            AppLayout::Tasks(_) => Layout::new(
+            MainArea::Tasks(_) => Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([70, 30]),
             )
             .split(main_chunks[1]),
-            _ => Layout::new(
+            MainArea::Calendar | MainArea::Events | MainArea::Weather => Layout::new(
                 Direction::Horizontal,
                 Constraint::from_percentages([100, 0]),
             )
@@ -1351,7 +1375,7 @@ impl Widget for &App {
                 let current_cell = drawn_dates[row_index][col_index];
                 let current_date = current_cell.0.day();
                 let is_cursor_here = cursor_date == current_date && current_cell.1;
-                let focus_on_calendar = matches!(self.app_layout, AppLayout::Calendar);
+                let focus_on_calendar = matches!(self.app_layout, MainArea::Calendar);
                 let day = if is_cursor_here && focus_on_calendar {
                     ratatui::widgets::ListItem::new(format!("{}{:<30}", current_date, " "))
                         .on_dark_gray()
@@ -1448,7 +1472,7 @@ impl Widget for &App {
         }
 
         match self.app_layout {
-            AppLayout::Events => {
+            MainArea::Events => {
                 let event_area_horizontal = Layout::new(
                     Direction::Vertical,
                     Constraint::from_percentages([16, 68, 16]),
@@ -1509,7 +1533,7 @@ impl Widget for &App {
                     .render(event_area[1], buf);
             }
 
-            AppLayout::Tasks(notes_visible) => {
+            MainArea::Tasks(notes_visible) => {
                 let tasks = self.tasks_cache.clone();
                 let items: Vec<Span> = {
                     tasks
@@ -1569,88 +1593,180 @@ impl Widget for &App {
                         .render(task_area[1], buf);
                 };
             }
-            AppLayout::Weather => {
-                let weather_area_horizontal = Layout::new(
+            MainArea::Weather => {
+                let weather_area =
+                    main_area[0].centered(Constraint::Length(98), Constraint::Length(30));
+
+                Clear::default().render(weather_area, buf);
+
+                let drawing_weather_area = Layout::new(
                     Direction::Vertical,
-                    [
-                        Constraint::Fill(1),
-                        Constraint::Length(11),
-                        Constraint::Fill(1),
-                    ],
+                    [Constraint::Fill(1), Constraint::Fill(1)],
                 )
-                .split(main_area[0]);
-                let weather_area = Layout::new(
+                .split(weather_area);
+
+                Block::bordered().render(drawing_weather_area[0], buf);
+
+                let current_weather_area = Layout::new(
                     Direction::Horizontal,
                     [
-                        Constraint::Fill(3),
                         Constraint::Length(20),
-                        Constraint::Fill(5),
-                        Constraint::Fill(3),
+                        Constraint::Fill(1),
+                        Constraint::Fill(1),
                     ],
                 )
-                .split(weather_area_horizontal[1]);
-                Clear::default().render(weather_area[1], buf);
-                Clear::default().render(weather_area[2], buf);
+                .split(drawing_weather_area[0]);
 
-                if let Some(current_weather) = &self.weather {
-                    let temperature = current_weather.main.temp;
-                    let feels_like = current_weather.main.feels_like;
-                    let humidity = current_weather.main.humidity;
-                    let wind = current_weather.wind.speed;
-                    let location = current_weather.name.clone();
-                    // let visibility = current_weather.visibility.unwrap_or(10000);
-                    // let precip = current_weather
-                    //     .rain
-                    //     .as_ref()
-                    //     .and_then(|p| p.one_hour)
-                    //     .unwrap_or(0.0);
-                    let weather = &current_weather.weather[0];
+                if let Some(current_weather) = &self.onecall_weather {
+                    let temperature = current_weather.current.temp;
+                    let feels_like = current_weather.current.feels_like;
+                    let humidity = current_weather.current.humidity;
+                    let wind = current_weather.current.wind_speed;
+                    let pressure = current_weather.current.pressure;
+                    let uvi = current_weather.current.uvi;
+                    let clouds = current_weather.current.clouds;
+                    let precip = current_weather
+                        .current
+                        .rain
+                        .as_ref()
+                        .and_then(|p| p.one_hour)
+                        .unwrap_or_else(|| {
+                            current_weather
+                                .current
+                                .snow
+                                .as_ref()
+                                .and_then(|p| p.one_hour)
+                                .unwrap_or(0.0)
+                        });
+                    let weather = &current_weather.current.weather[0];
                     let general_weather = weather.main.clone();
-                    let detailed_weather = weather.description.clone();
                     let icon = weather::get_weather_icon(weather.icon.clone());
 
                     let text = vec![
-                        Line::raw(format!("Location     >   {location}")),
-                        Line::raw(format!(
-                            "Weather      >   {general_weather} ({detailed_weather})"
-                        )),
-                        Line::raw(format!(
-                            "Temperature  >   {temperature}°C (feels like {feels_like}°C)"
-                        )),
-                        Line::raw(format!("Wind         >   {wind}m/s")),
-                        Line::raw(format!("Humidity     >   {humidity}%")),
-                        // Line::raw(format!("Precip       >   {precip}mm/h")),
-                        // Line::raw(format!("Visibility   >   {visibility}m")),
+                        Line::raw(format!("Current Weather"))
+                            .centered()
+                            .yellow()
+                            .bold()
+                            .italic(),
+                        Line::raw(format!("")),
+                        Line::raw(format!("Weather        ┃  {general_weather}")),
+                        Line::raw(format!("Temperature    ┃  {temperature}°C")),
+                        Line::raw(format!("Feels Like     ┃  {feels_like}°C")),
+                        Line::raw(format!("Humidity       ┃  {humidity}%")),
+                        Line::raw(format!("Precipitation  ┃  {precip} mm")),
+                        Line::raw(format!("Cloud cover    ┃  {clouds}%")),
+                        Line::raw(format!("Wind           ┃  {wind} m/s")),
+                        Line::raw(format!("Pressure       ┃  {pressure} hPa")),
+                        Line::raw(format!("UV Index       ┃  {uvi}")),
                     ];
-                    ratatui::widgets::Paragraph::new(text)
-                        .block(
-                            Block::new()
-                                .padding(ratatui::widgets::Padding {
-                                    right: 0,
-                                    left: 0,
-                                    top: 2,
-                                    bottom: 2,
-                                })
-                                .borders(Borders::TOP | Borders::BOTTOM | Borders::RIGHT),
-                        )
-                        .render(weather_area[2], buf);
 
                     ratatui::widgets::Paragraph::new(icon)
-                        .block(
-                            Block::new()
-                                .padding(ratatui::widgets::Padding {
-                                    right: 0,
-                                    left: 3,
-                                    top: 1,
-                                    bottom: 0,
-                                })
-                                .borders(Borders::TOP | Borders::BOTTOM | Borders::LEFT),
-                        )
-                        .render(weather_area[1], buf);
+                        .block(Block::new().padding(ratatui::widgets::Padding {
+                            right: 0,
+                            left: 6,
+                            top: 4,
+                            bottom: 0,
+                        }))
+                        .render(current_weather_area[0], buf);
+
+                    ratatui::widgets::Paragraph::new(text)
+                        .block(Block::new().padding(ratatui::widgets::Padding {
+                            right: 5,
+                            left: 5,
+                            top: 2,
+                            bottom: 2,
+                        }))
+                        .render(current_weather_area[1], buf);
+
+                    fn render_weather<'a>(w: &weather::DailyWeather, title: &str) -> Vec<Line<'a>> {
+                        let forecasted_weather = w.weather[0].main.clone();
+                        let temp_max = w.temp.max;
+                        let temp_min = w.temp.min;
+                        let humidity = w.humidity;
+                        let pressure = w.pressure;
+                        let pop = (w.pop * 100.0) as u16;
+                        let uvi = w.uvi;
+                        let wind = w.wind_speed;
+                        let precip = w
+                            .rain
+                            .as_ref()
+                            .unwrap_or_else(|| w.snow.as_ref().unwrap_or(&0.0));
+
+                        vec![
+                            Line::raw(format!("{title}"))
+                                .centered()
+                                .yellow()
+                                .bold()
+                                .italic(),
+                            Line::raw(format!("")),
+                            Line::raw(format!("Weather        ┃  {forecasted_weather}")),
+                            Line::raw(format!("Low            ┃  {temp_min}°C")),
+                            Line::raw(format!("High           ┃  {temp_max}°C")),
+                            Line::raw(format!("Humidity       ┃  {humidity}%")),
+                            Line::raw(format!("Precipitation  ┃  {precip} mm")),
+                            Line::raw(format!("Chance of rain ┃  {pop}%")),
+                            Line::raw(format!("Wind           ┃  {wind} m/s")),
+                            Line::raw(format!("Pressure       ┃  {pressure} hPa")),
+                            Line::raw(format!("UV Index       ┃  {uvi}")),
+                        ]
+                    }
+
+                    ratatui::widgets::Paragraph::new(render_weather(
+                        &current_weather.daily[0],
+                        "Today's Forecast",
+                    ))
+                    .block(Block::new().padding(ratatui::widgets::Padding {
+                        right: 5,
+                        left: 5,
+                        top: 2,
+                        bottom: 2,
+                    }))
+                    .render(current_weather_area[2], buf);
+
+                    let forecast_area = Layout::new(
+                        Direction::Horizontal,
+                        [Constraint::Fill(1), Constraint::Fill(1)],
+                    )
+                    .split(drawing_weather_area[1]);
+
+                    ratatui::widgets::Paragraph::new(render_weather(
+                        &current_weather.daily[self.weather_day],
+                        &self
+                            .today
+                            .checked_add_days(Days::new(self.weather_day.try_into().unwrap()))
+                            .unwrap()
+                            .format("%A, %B %d")
+                            .to_string(),
+                    ))
+                    .block(Block::bordered().padding(ratatui::widgets::Padding {
+                        right: 10,
+                        left: 10,
+                        top: 1,
+                        bottom: 1,
+                    }))
+                    .render(forecast_area[0], buf);
+
+                    ratatui::widgets::Paragraph::new(render_weather(
+                        &current_weather.daily[self.weather_day + 1],
+                        &self
+                            .today
+                            .checked_add_days(Days::new((self.weather_day + 1).try_into().unwrap()))
+                            .unwrap()
+                            .format("%A, %B %d")
+                            .to_string(),
+                    ))
+                    .block(Block::bordered().padding(ratatui::widgets::Padding {
+                        right: 10,
+                        left: 10,
+                        top: 1,
+                        bottom: 1,
+                    }))
+                    .render(forecast_area[1], buf);
                 };
             }
-            AppLayout::Calendar => {}
+            MainArea::Calendar => {}
         }
+
         // Bottom Area
 
         let bottom_area = Layout::new(
@@ -1682,7 +1798,7 @@ impl Widget for &App {
         // Text input area
 
         if self.inputting {
-            if let AppLayout::Tasks(_) = self.app_layout {
+            if let MainArea::Tasks(_) = self.app_layout {
                 Paragraph::new(" Tasks: ").render(bottom_area[0], buf)
             } else {
                 Paragraph::new(" Event: ").render(bottom_area[0], buf)
