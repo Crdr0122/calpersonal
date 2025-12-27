@@ -5,7 +5,7 @@ use serde::Deserialize;
 pub struct OneCallResponse {
     pub current: WeatherData,
     pub daily: Vec<DailyWeather>,
-    pub alerts: Vec<Alert>,
+    pub alerts: Option<Vec<Alert>>,
 }
 #[derive(Deserialize)]
 pub struct WeatherData {
