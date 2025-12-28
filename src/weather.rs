@@ -68,8 +68,8 @@ pub struct Alert {
 
 pub async fn fetch_weather(
     api_key: &str,
-    city: String,
-    country: String,
+    city: &str,
+    country: &str,
 ) -> Option<OneCallResponse> {
     let geo_url = format!(
         "http://api.openweathermap.org/geo/1.0/direct?q={},{}&limit=1&appid={}",
@@ -94,8 +94,8 @@ pub async fn fetch_weather(
     None
 }
 
-pub fn get_weather_icon(icon: String) -> String {
-    match icon.as_str() {
+pub fn get_weather_icon(icon: &str) -> String {
+    match icon {
         "01d" | "01n" => r"
    \   /  
     .-.    

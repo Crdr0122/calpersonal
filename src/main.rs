@@ -28,6 +28,7 @@ use weather::OneCallResponse;
 struct App {
     config: Option<config::Config>,
     app_layout: MainArea,
+    task_show_done: bool,
     current_date: NaiveDate, // The date being displayed
     today: NaiveDate,        // Today's date for comparison
     cursor_line: usize,
@@ -38,7 +39,7 @@ struct App {
     event_hub: Option<CalendarHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
     events_cache: HashMap<NaiveDate, Vec<(api::Event, String)>>, // date → events that day
     task_hub: Option<TasksHub<hyper_rustls::HttpsConnector<connect::HttpConnector>>>, // The authenticated client
-    tasks_cache: Vec<(Task, String)>, // date → events that day
+    tasks_cache: (Vec<(Task, String)>, Vec<(Task, String)>), // date → events that day
 
     change_feedback_tx: Option<tokio::sync::mpsc::Sender<(String, StatusColor)>>,
     change_feedback_rx: Option<tokio::sync::mpsc::Receiver<(String, StatusColor)>>,
@@ -56,7 +57,8 @@ struct App {
 
     events_update_rx:
         Option<tokio::sync::mpsc::Receiver<HashMap<NaiveDate, Vec<(api::Event, String)>>>>,
-    tasks_update_rx: Option<tokio::sync::mpsc::Receiver<Vec<(Task, String)>>>,
+    tasks_update_rx:
+        Option<tokio::sync::mpsc::Receiver<(Vec<(Task, String)>, Vec<(Task, String)>)>>,
     needs_refresh: bool,
 
     auth_status: AuthStatus,
@@ -120,6 +122,7 @@ impl App {
             app_layout: MainArea::Calendar,
             cursor_line: 0,
             app_tz,
+            task_show_done: false,
             exit: false,
 
             event_hub: None,
@@ -659,15 +662,20 @@ impl App {
     }
 
     fn selected_task_index(&self) -> Option<usize> {
-        if self.tasks_cache.is_empty() {
+        let which_tasklist = if self.task_show_done {
+            &self.tasks_cache.1
+        } else {
+            &self.tasks_cache.0
+        };
+        if which_tasklist.is_empty() {
             return None;
         }
 
         let idx = self.cursor_line;
-        if idx < self.tasks_cache.len() {
+        if idx < which_tasklist.len() {
             Some(idx)
         } else {
-            Some(self.tasks_cache.len().saturating_sub(1))
+            Some(which_tasklist.len().saturating_sub(1))
         }
     }
 
@@ -678,7 +686,13 @@ impl App {
 
     fn selected_task(&self) -> Option<&(Task, String)> {
         let idx = self.selected_task_index()?;
-        self.tasks_cache.get(idx)
+        let which_tasklist = if self.task_show_done {
+            &self.tasks_cache.1
+        } else {
+            &self.tasks_cache.0
+        };
+
+        which_tasklist.get(idx)
     }
 
     fn start_background_refresh(&mut self) {
@@ -708,14 +722,15 @@ impl App {
             self.refreshing_status = ("Refreshing".to_string(), StatusColor::Green);
             tokio::spawn(async move {
                 if let Some(mut new_tasks) = App::fetch_tasks(&hub).await {
-                    new_tasks.sort_unstable_by_key(|t| {
-                        (
-                            t.0.status.clone().unwrap_or("".to_string()),
-                            t.0.due.clone().unwrap_or("".to_string()),
-                        )
+                    let mut yet_tasks = Vec::new();
+                    let mut done_tasks = Vec::new();
+                    new_tasks.sort_unstable_by_key(|t| t.0.due.clone().unwrap_or("".to_string()));
+                    new_tasks.iter().for_each(|t| match t.0.completed {
+                        Some(_) => done_tasks.push(t.clone()),
+                        None => yet_tasks.push(t.clone()),
                     });
-                    file_writing::save_tasks_cache(&new_tasks);
-                    let _ = tx.send(new_tasks).await;
+                    file_writing::save_tasks_cache((&yet_tasks, &done_tasks));
+                    let _ = tx.send((yet_tasks, done_tasks)).await;
                 }
             });
         }
@@ -729,12 +744,12 @@ impl App {
         {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.weather_rx = Some(rx);
-            let a = api_key.clone();
-            let c = city.clone();
-            let co = country.clone();
+            let api_key = api_key.clone();
+            let city = city.clone();
+            let country = country.clone();
             tokio::spawn(async move {
                 if let Some(current_weather) =
-                    weather::fetch_weather(&a, c.to_string(), co.to_string()).await
+                    weather::fetch_weather(&api_key, &city, &country).await
                 {
                     let _ = tx.send(current_weather).await;
                 }
@@ -955,8 +970,8 @@ impl App {
             KeyCode::Char('l') => self.move_right(),
             KeyCode::Char('k') => self.move_up(),
             KeyCode::Char('j') => self.move_down(),
-            KeyCode::Char('>') => self.add_month_or_weather(),
-            KeyCode::Char('<') => self.sub_month_or_weather(),
+            KeyCode::Char('>') => self.add_month_or_weather_or_done(),
+            KeyCode::Char('<') => self.sub_month_or_weather_or_done(),
             KeyCode::Char('y') => {
                 self.current_date = self
                     .current_date
@@ -1007,14 +1022,18 @@ impl App {
         };
     }
 
-    fn add_month_or_weather(&mut self) {
+    fn add_month_or_weather_or_done(&mut self) {
         match self.app_layout {
             MainArea::Weather => {
-                if self.weather_day < 6 {
+                if self.weather_day < 7 {
                     self.weather_day += 1
                 }
             }
-            MainArea::Calendar | MainArea::Tasks(_) | MainArea::Events => {
+            MainArea::Tasks(_) => {
+                self.task_show_done = !self.task_show_done;
+                self.cursor_line = 0
+            }
+            MainArea::Calendar | MainArea::Events => {
                 self.current_date = self
                     .current_date
                     .checked_add_months(Months::new(1))
@@ -1023,14 +1042,18 @@ impl App {
         }
     }
 
-    fn sub_month_or_weather(&mut self) {
+    fn sub_month_or_weather_or_done(&mut self) {
         match self.app_layout {
             MainArea::Weather => {
                 if self.weather_day > 1 {
                     self.weather_day -= 1
                 }
             }
-            MainArea::Calendar | MainArea::Tasks(_) | MainArea::Events => {
+            MainArea::Tasks(_) => {
+                self.task_show_done = !self.task_show_done;
+                self.cursor_line = 0
+            }
+            MainArea::Calendar | MainArea::Events => {
                 self.current_date = self
                     .current_date
                     .checked_sub_months(Months::new(1))
@@ -1194,8 +1217,14 @@ impl App {
     fn move_down(&mut self) {
         match self.app_layout {
             MainArea::Tasks(_) => {
-                if self.cursor_line < self.tasks_cache.len() - 1 {
-                    self.cursor_line = self.cursor_line + 1;
+                if self.task_show_done {
+                    if self.cursor_line < self.tasks_cache.1.len() - 1 {
+                        self.cursor_line = self.cursor_line + 1;
+                    }
+                } else {
+                    if self.cursor_line < self.tasks_cache.0.len() - 1 {
+                        self.cursor_line = self.cursor_line + 1;
+                    }
                 }
             }
             MainArea::Events => {
@@ -1535,8 +1564,13 @@ impl Widget for &App {
 
             MainArea::Tasks(notes_visible) => {
                 let tasks = self.tasks_cache.clone();
+                let done_or_yet_tasks = if self.task_show_done {
+                    tasks.1
+                } else {
+                    tasks.0
+                };
                 let items: Vec<Span> = {
-                    tasks
+                    done_or_yet_tasks
                         .iter()
                         .enumerate()
                         .map(|(i, ev)| {
@@ -1595,7 +1629,7 @@ impl Widget for &App {
             }
             MainArea::Weather => {
                 let weather_area =
-                    main_area[0].centered(Constraint::Length(98), Constraint::Length(30));
+                    main_area[0].centered(Constraint::Length(98), Constraint::Length(28));
 
                 Clear::default().render(weather_area, buf);
 
@@ -1640,7 +1674,7 @@ impl Widget for &App {
                         });
                     let weather = &current_weather.current.weather[0];
                     let general_weather = weather.main.clone();
-                    let icon = weather::get_weather_icon(weather.icon.clone());
+                    let icon = weather::get_weather_icon(&weather.icon);
 
                     let text = vec![
                         Line::raw(format!("Current Weather"))
@@ -1664,7 +1698,7 @@ impl Widget for &App {
                         .block(Block::new().padding(ratatui::widgets::Padding {
                             right: 0,
                             left: 6,
-                            top: 4,
+                            top: 3,
                             bottom: 0,
                         }))
                         .render(current_weather_area[0], buf);
@@ -1673,7 +1707,7 @@ impl Widget for &App {
                         .block(Block::new().padding(ratatui::widgets::Padding {
                             right: 5,
                             left: 5,
-                            top: 2,
+                            top: 1,
                             bottom: 2,
                         }))
                         .render(current_weather_area[1], buf);
@@ -1718,7 +1752,7 @@ impl Widget for &App {
                     .block(Block::new().padding(ratatui::widgets::Padding {
                         right: 5,
                         left: 5,
-                        top: 2,
+                        top: 1,
                         bottom: 2,
                     }))
                     .render(current_weather_area[2], buf);
@@ -1729,11 +1763,36 @@ impl Widget for &App {
                     )
                     .split(drawing_weather_area[1]);
 
+                    let mut alert_title = vec![
+                        Text::raw("Alerts").centered().yellow().bold().italic(),
+                        Text::raw(format!("")),
+                    ];
+                    let alerts_list = if let Some(alerts) = &current_weather.alerts {
+                        alerts
+                            .iter()
+                            .map(|alert| {
+                                Text::raw(format!("{}: {}", alert.sender_name, alert.event))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    alert_title.extend_from_slice(&alerts_list);
+
+                    ratatui::widgets::List::new(alert_title)
+                        .block(Block::bordered().padding(ratatui::widgets::Padding {
+                            right: 10,
+                            left: 10,
+                            top: 0,
+                            bottom: 1,
+                        }))
+                        .render(forecast_area[0], buf);
+
                     ratatui::widgets::Paragraph::new(render_weather(
                         &current_weather.daily[self.weather_day],
                         &self
                             .today
-                            .checked_add_days(Days::new(self.weather_day.try_into().unwrap()))
+                            .checked_add_days(Days::new((self.weather_day).try_into().unwrap()))
                             .unwrap()
                             .format("%A, %B %d")
                             .to_string(),
@@ -1741,24 +1800,7 @@ impl Widget for &App {
                     .block(Block::bordered().padding(ratatui::widgets::Padding {
                         right: 10,
                         left: 10,
-                        top: 1,
-                        bottom: 1,
-                    }))
-                    .render(forecast_area[0], buf);
-
-                    ratatui::widgets::Paragraph::new(render_weather(
-                        &current_weather.daily[self.weather_day + 1],
-                        &self
-                            .today
-                            .checked_add_days(Days::new((self.weather_day + 1).try_into().unwrap()))
-                            .unwrap()
-                            .format("%A, %B %d")
-                            .to_string(),
-                    ))
-                    .block(Block::bordered().padding(ratatui::widgets::Padding {
-                        right: 10,
-                        left: 10,
-                        top: 1,
+                        top: 0,
                         bottom: 1,
                     }))
                     .render(forecast_area[1], buf);
