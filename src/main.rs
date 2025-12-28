@@ -1025,7 +1025,7 @@ impl App {
     fn add_month_or_weather_or_done(&mut self) {
         match self.app_layout {
             MainArea::Weather => {
-                if self.weather_day < 7 {
+                if self.weather_day < 6 {
                     self.weather_day += 1
                 }
             }
@@ -1045,7 +1045,7 @@ impl App {
     fn sub_month_or_weather_or_done(&mut self) {
         match self.app_layout {
             MainArea::Weather => {
-                if self.weather_day > 1 {
+                if self.weather_day > 0 {
                     self.weather_day -= 1
                 }
             }
@@ -1763,23 +1763,41 @@ impl Widget for &App {
                     )
                     .split(drawing_weather_area[1]);
 
-                    let mut alert_title = vec![
-                        Text::raw("Alerts").centered().yellow().bold().italic(),
-                        Text::raw(format!("")),
-                    ];
-                    let alerts_list = if let Some(alerts) = &current_weather.alerts {
-                        alerts
-                            .iter()
-                            .map(|alert| {
-                                Text::raw(format!("{}: {}", alert.sender_name, alert.event))
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    alert_title.extend_from_slice(&alerts_list);
+                    if self.weather_day == 0 {
+                        let mut alert_title = vec![
+                            Text::raw("Alerts").centered().yellow().bold().italic(),
+                            Text::raw(format!("")),
+                        ];
+                        let alerts_list = if let Some(alerts) = &current_weather.alerts {
+                            alerts
+                                .iter()
+                                .map(|alert| {
+                                    Text::raw(format!("{}: {}", alert.sender_name, alert.event))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        alert_title.extend_from_slice(&alerts_list);
 
-                    ratatui::widgets::List::new(alert_title)
+                        ratatui::widgets::List::new(alert_title)
+                            .block(Block::bordered().padding(ratatui::widgets::Padding {
+                                right: 10,
+                                left: 10,
+                                top: 0,
+                                bottom: 1,
+                            }))
+                            .render(forecast_area[0], buf);
+                    } else {
+                        ratatui::widgets::Paragraph::new(render_weather(
+                            &current_weather.daily[self.weather_day],
+                            &self
+                                .today
+                                .checked_add_days(Days::new((self.weather_day).try_into().unwrap()))
+                                .unwrap()
+                                .format("%A, %B %d")
+                                .to_string(),
+                        ))
                         .block(Block::bordered().padding(ratatui::widgets::Padding {
                             right: 10,
                             left: 10,
@@ -1787,12 +1805,13 @@ impl Widget for &App {
                             bottom: 1,
                         }))
                         .render(forecast_area[0], buf);
+                    }
 
                     ratatui::widgets::Paragraph::new(render_weather(
-                        &current_weather.daily[self.weather_day],
+                        &current_weather.daily[self.weather_day + 1],
                         &self
                             .today
-                            .checked_add_days(Days::new((self.weather_day).try_into().unwrap()))
+                            .checked_add_days(Days::new((self.weather_day + 1).try_into().unwrap()))
                             .unwrap()
                             .format("%A, %B %d")
                             .to_string(),
