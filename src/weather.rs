@@ -63,7 +63,7 @@ pub struct DailyTemp {
 pub struct Alert {
     pub sender_name: String,
     pub event: String,
-    pub description: String,
+    // pub description: String,
 }
 
 pub async fn fetch_weather(
