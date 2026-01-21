@@ -613,7 +613,7 @@ impl App {
         let start_date = first_day - chrono::Duration::days(first_weekday as i64);
         let number_of_days = last_day.signed_duration_since(start_date).num_days();
         // Number of days for duration is one less than days need to display
-        let number_of_rows = if number_of_days > 33 {
+        let number_of_rows = if number_of_days > 34 {
             6
         } else if number_of_days < 28 {
             4
