@@ -18,15 +18,37 @@ pub async fn get_tasks_hub()
         .await
         .map_err(|e| format!("clientsecret.json not found: {}", e))?;
 
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .unwrap()
+        .https_only()
+        .enable_http2()
+        .build();
+
+    let executor = hyper_util::rt::TokioExecutor::new();
+
     // 2. Authenticator (opens browser first time, reuses tokencache.json)
-    let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
+    let auth = yup_oauth2::InstalledFlowAuthenticator::with_client(
         secret,
         yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
+        yup_oauth2::client::CustomHyperClientBuilder::from(
+            hyper_util::client::legacy::Client::builder(executor).build(connector),
+        ),
     )
     .persist_tokens_to_disk(token_path)
     .build()
     .await
     .map_err(|e| format!("Failed to create authenticator: {}", e))?;
+
+    // 2. Authenticator (opens browser first time, reuses tokencache.json)
+    // let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
+    //     secret,
+    //     yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
+    // )
+    // .persist_tokens_to_disk(token_path)
+    // .build()
+    // .await
+    // .map_err(|e| format!("Failed to create authenticator: {}", e))?;
 
     let scopes = &["https://www.googleapis.com/auth/tasks"];
     auth.token(scopes)

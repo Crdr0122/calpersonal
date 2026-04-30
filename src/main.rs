@@ -885,43 +885,53 @@ impl App {
         let mut map: HashMap<NaiveDate, Vec<(api::Event, String)>> = HashMap::new();
 
         for entry in calendars {
-            if let Some(id) = entry.id {
-                let re_encoded_id = urlencoding::encode(&id);
-                match hub
-                    .events()
-                    .list(&re_encoded_id)
-                    .add_scope(google_calendar3::api::Scope::Full)
-                    .single_events(true)
-                    .order_by("startTime")
-                    .doit()
-                    .await
-                {
-                    Ok((_, events_list)) => {
-                        if let Some(items) = events_list.items {
-                            for event in items {
-                                let start_date_and_event = if let Some(start) = &event.start {
-                                    if let Some(date_time_str) = start.date_time {
-                                        // Convert to your local timezone and get the local date + time
-                                        let local_dt = date_time_str.with_timezone(&app_tz);
-                                        Some(local_dt.date_naive())
-                                    } else if let Some(date_str) = start.date {
-                                        Some(date_str)
+            if let Some(calendar_id) = entry.id {
+                let re_encoded_id = urlencoding::encode(&calendar_id);
+                let mut page_token: Option<String> = None;
+                loop {
+                    let mut request = hub
+                        .events()
+                        .list(&re_encoded_id)
+                        .add_scope(google_calendar3::api::Scope::Full)
+                        .single_events(true)
+                        .order_by("startTime")
+                        .max_results(2500);
+
+                    if let Some(token) = &page_token {
+                        request = request.page_token(token);
+                    }
+
+                    match request.doit().await {
+                        Ok((_, events_list)) => {
+                            if let Some(items) = events_list.items {
+                                for event in items {
+                                    let start_date_and_event = if let Some(start) = &event.start {
+                                        if let Some(date_time_str) = start.date_time {
+                                            let local_dt = date_time_str.with_timezone(&app_tz);
+                                            Some(local_dt.date_naive())
+                                        } else if let Some(date_str) = start.date {
+                                            Some(date_str)
+                                        } else {
+                                            None
+                                        }
                                     } else {
                                         None
+                                    };
+                                    if let Some(start_date) = start_date_and_event {
+                                        map.entry(start_date)
+                                            .or_default()
+                                            .push((event, re_encoded_id.to_string().clone()));
                                     }
-                                } else {
-                                    None
-                                };
-                                if let Some(start_date) = start_date_and_event {
-                                    map.entry(start_date)
-                                        .or_default()
-                                        .push((event, re_encoded_id.to_string().clone()));
                                 }
                             }
+                            page_token = events_list.next_page_token;
+                            if page_token.is_none() {
+                                break; // No more pages → exit inner loop
+                            }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to fetch events: {e:?}");
+                        Err(e) => {
+                            eprintln!("Failed to fetch events: {e:?}");
+                        }
                     }
                 }
             }
@@ -942,7 +952,7 @@ impl App {
         let mut all_tasks = Vec::new();
         for tasklist in tasklists {
             if let Some(tasklist_id) = tasklist.id {
-                match hub.tasks().list(&tasklist_id).doit().await {
+                match hub.tasks().list(&tasklist_id).max_results(100).doit().await {
                     Ok((_, tasks)) => {
                         if let Some(items) = tasks.items {
                             let tasks_with_list: Vec<(Task, String)> = items
